@@ -1,0 +1,28 @@
+{
+  "run_name": "olmoe_1b7b_wikitext2",
+  "model": {
+    "name_or_path": "allenai/OLMoE-1B-7B-0924",
+    "dtype": "bfloat16",
+    "device_map": "cuda:0",
+    "attn_implementation": "sdpa"
+  },
+  "data": {
+    "dataset": "wikitext",
+    "subset": "wikitext-2-raw-v1",
+    "split": "test",
+    "seq_len": 1024,
+    "max_sequences": 128,
+    "batch_size": 8
+  },
+  "profiler": {
+    "record_trace": true,
+    "trace_flush_rows": 2000000,
+    "cross_check_router": true,
+    "max_new_tokens": 0
+  },
+  "classify": {
+    "method": "top_fraction",
+    "value": 0.2,
+    "per_layer": true
+  }
+}

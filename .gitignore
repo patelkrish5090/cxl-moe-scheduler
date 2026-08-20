@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Large run artefacts: traces can reach 10^8 rows. Summary CSVs, metadata and
+# plots under data/runs/ are small and worth keeping.
+data/runs/**/trace.parquet
+data/runs/**/trace.csv
+data/logs/
+data/traces/

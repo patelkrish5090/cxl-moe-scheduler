@@ -1,0 +1,28 @@
+{
+  "run_name": "smoke_tiny",
+  "model": {
+    "name_or_path": "hf-internal-testing/Mixtral-tiny",
+    "dtype": "float32",
+    "device_map": "cpu",
+    "random_init": true,
+    "attn_implementation": "eager"
+  },
+  "data": {
+    "dataset": "wikitext",
+    "subset": "wikitext-2-raw-v1",
+    "split": "test",
+    "seq_len": 128,
+    "max_sequences": 8,
+    "batch_size": 4
+  },
+  "profiler": {
+    "record_trace": true,
+    "cross_check_router": true,
+    "max_new_tokens": 0
+  },
+  "classify": {
+    "method": "top_fraction",
+    "value": 0.25,
+    "per_layer": true
+  }
+}
