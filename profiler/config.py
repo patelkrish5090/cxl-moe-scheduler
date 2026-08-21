@@ -17,6 +17,12 @@ class ModelConfig:
 
     Attributes:
         name_or_path: Hugging Face repo id or local directory.
+        tokenizer_name_or_path: Load the tokenizer from a different repo than the
+            weights. Needed when a repo ships no tokenizer files at all -- e.g.
+            ``hf-internal-testing/Mixtral-tiny`` contains only config.json and
+            model.safetensors. Must have a vocabulary no larger than the model's
+            ``vocab_size``; the runner checks this and fails loudly if not.
+            Defaults to ``name_or_path``.
         dtype: Torch dtype name ("bfloat16", "float16", "float32", "auto").
         device_map: Passed to ``from_pretrained``. "auto" shards across visible
             GPUs; "cpu" forces CPU; None loads onto the default device.
@@ -36,6 +42,7 @@ class ModelConfig:
     """
 
     name_or_path: str
+    tokenizer_name_or_path: str | None = None
     dtype: str = "bfloat16"
     device_map: str | None = "auto"
     trust_remote_code: bool = False

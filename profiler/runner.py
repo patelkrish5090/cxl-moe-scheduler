@@ -47,9 +47,26 @@ def load_model_and_tokenizer(cfg: RunConfig) -> tuple[Any, Any]:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     model_cfg = cfg.model
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_cfg.name_or_path, trust_remote_code=model_cfg.trust_remote_code
-    )
+    tokenizer_source = model_cfg.tokenizer_name_or_path or model_cfg.name_or_path
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source, trust_remote_code=model_cfg.trust_remote_code
+        )
+    except (ValueError, OSError) as exc:
+        if "backend tokenizer" in str(exc) or "Can't load tokenizer" in str(exc):
+            raise RuntimeError(
+                f"could not build a tokenizer from {tokenizer_source!r}.\n"
+                "Two different causes produce this same message:\n"
+                "  1. The repo ships no tokenizer files at all (weights-only test "
+                "repos such as hf-internal-testing/Mixtral-tiny are like this). Set "
+                "model.tokenizer_name_or_path in the run config to a repo that has "
+                "one, with a vocabulary no larger than the model's vocab_size.\n"
+                "  2. The repo ships a SentencePiece tokenizer.model with no "
+                "pre-built tokenizer.json, so transformers must convert it:\n"
+                "         pip install sentencepiece protobuf\n"
+                "     (Mixtral-8x7B needs this; OLMoE does not.)"
+            ) from exc
+        raise
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -161,6 +178,19 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
     log(f"[3/6] loading corpus {cfg.data.dataset}/{cfg.data.subset} split={cfg.data.split}")
     token_stream = data.load_token_stream(cfg.data, tokenizer)
     sequences = data.pack_sequences(token_stream, cfg.data.seq_len, cfg.data.max_sequences)
+
+    # A token id at or above the embedding size indexes out of bounds. On CPU
+    # that is an IndexError; on CUDA it is an async device-side assert that
+    # surfaces later with an unrelated stack trace. Check it here instead.
+    model_vocab = getattr(model.config, "vocab_size", None)
+    max_token_id = int(sequences.max())
+    if isinstance(model_vocab, int) and max_token_id >= model_vocab:
+        raise RuntimeError(
+            f"tokenizer produced id {max_token_id} but the model's vocab_size is "
+            f"{model_vocab}. The tokenizer ({cfg.model.tokenizer_name_or_path or cfg.model.name_or_path!r}) "
+            f"does not match the model ({cfg.model.name_or_path!r}). Set "
+            "model.tokenizer_name_or_path to a compatible tokenizer."
+        )
     n_prefill_tokens = int(sequences.size)
     n_decode_tokens = sequences.shape[0] * cfg.profiler.max_new_tokens
     est_rows = (n_prefill_tokens + n_decode_tokens) * len(sites) * sites[0].top_k

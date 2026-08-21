@@ -7,6 +7,15 @@ transformers>=5.0.0
 datasets>=3.0.0
 accelerate>=1.0.0
 safetensors>=0.4.0
+
+# Tokenizer conversion. Mixtral (and the Mixtral-tiny smoke model) ship a
+# SentencePiece tokenizer.model with no pre-built tokenizer.json; transformers
+# needs sentencepiece to read it and protobuf to parse the model proto when
+# converting it to a fast tokenizer. Without both, AutoTokenizer.from_pretrained
+# fails with "Couldn't instantiate the backend tokenizer".
+sentencepiece>=0.2.0
+protobuf>=4.25
+
 numpy>=1.24
 pandas>=2.0
 pyarrow>=14.0          # parquet writer for the per-token activation trace

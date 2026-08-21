@@ -52,6 +52,22 @@ bash scripts/setup_env.sh && conda activate astera
 resolving numpy/pandas downwards underneath whatever is currently holding ~88 GB
 on GPU 0.
 
+### Hugging Face access
+
+`allenai/OLMoE-1B-7B-0924`, `hf-internal-testing/Mixtral-tiny` and WikiText-2 are
+public and need no token. The "unauthenticated requests" warning is harmless for
+those, though a token raises the rate limit -- which matters on a shared NAT,
+where the anonymous per-IP limit is shared with everyone else on the network.
+
+`mistralai/Mixtral-8x7B-v0.1` is **gated**: accept the terms on the model page
+while logged in, and export a token, or the download fails with 401/403.
+
+```bash
+hf auth login                      # or: export HF_TOKEN=hf_xxxx
+```
+
+Request access early -- approval is usually instant but can queue.
+
 ### GPU selection
 
 `scripts/run_stage1.sh` pins to **physical GPU 1** (`CUDA_VISIBLE_DEVICES=1`),

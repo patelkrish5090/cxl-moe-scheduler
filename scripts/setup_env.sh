@@ -19,6 +19,41 @@ cd "$(dirname "$0")/.."
 ENV_NAME="${ENV_NAME:-astera}"
 PY_VERSION="${PY_VERSION:-3.12}"
 
+# --- TLS interception preflight -------------------------------------------
+# This network runs a Sophos firewall that terminates and re-signs HTTPS. The
+# system CA store can be taught to trust it (see profiler/README.md), but Python
+# does NOT use the system store -- pip, requests and huggingface_hub all use
+# certifi's own bundle, so they keep failing after `update-ca-certificates`
+# alone. Setting these makes every Python HTTPS client use the system bundle.
+CA_BUNDLE="${ASTERA_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+if [ -f "$CA_BUNDLE" ]; then
+  export SSL_CERT_FILE="$CA_BUNDLE"
+  export REQUESTS_CA_BUNDLE="$CA_BUNDLE"
+  export CURL_CA_BUNDLE="$CA_BUNDLE"
+  echo "using CA bundle: $CA_BUNDLE"
+else
+  echo "WARNING: CA bundle not found at $CA_BUNDLE; TLS verification may fail." >&2
+fi
+
+if ! curl -fsS --max-time 20 https://pypi.org/simple/ -o /dev/null 2>/dev/null; then
+  cat >&2 <<'MSG'
+
+WARNING: cannot verify a TLS connection to pypi.org.
+
+If this is the Sophos inspection proxy, install its root certificate first:
+
+  openssl s_client -showcerts -connect github.com:443 </dev/null 2>/dev/null |
+    awk '/-----BEGIN CERTIFICATE-----/{c++} c==2{print} /-----END CERTIFICATE-----/{if(c==2) exit}' > /tmp/sophos-ca.crt
+  sudo cp /tmp/sophos-ca.crt /usr/local/share/ca-certificates/sophos-ca.crt
+  sudo update-ca-certificates
+  pip config set global.cert /etc/ssl/certs/ca-certificates.crt
+
+Verify the certificate's SHA-256 fingerprint with your network admin before
+trusting it. Continuing anyway -- the install below will likely fail.
+
+MSG
+fi
+
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
   echo "conda env '$ENV_NAME' already exists; installing into it."
 else

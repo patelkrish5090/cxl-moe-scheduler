@@ -2,6 +2,7 @@
   "run_name": "smoke_tiny",
   "model": {
     "name_or_path": "hf-internal-testing/Mixtral-tiny",
+    "tokenizer_name_or_path": "hf-internal-testing/llama-tokenizer",
     "dtype": "float32",
     "device_map": "cpu",
     "random_init": true,

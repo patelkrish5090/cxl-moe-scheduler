@@ -8,3 +8,6 @@ data/runs/**/trace.parquet
 data/runs/**/trace.csv
 data/logs/
 data/traces/
+
+CLAUDE.md
+docs.md
