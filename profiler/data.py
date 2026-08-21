@@ -8,11 +8,41 @@ padding.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Iterator
 
 import numpy as np
 
 from .config import DataConfig
+
+# Datasets that used to live at a bare "canonical" id with no namespace. Recent
+# huggingface_hub versions parse dataset paths as HF URIs and reject a repo id
+# without a "namespace/name" form, so `load_dataset("wikitext", ...)` fails with
+# HfUriError deep inside the resolver. These are the same datasets at their
+# current namespaced locations.
+_LEGACY_DATASET_IDS: dict[str, str] = {
+    "wikitext": "Salesforce/wikitext",
+    "ptb_text_only": "ptb-text-only/ptb_text_only",
+    "c4": "allenai/c4",
+}
+
+
+def resolve_dataset_id(dataset: str) -> str:
+    """Map a legacy bare dataset id onto its namespaced equivalent.
+
+    Returns ``dataset`` unchanged when it already has a namespace or is unknown.
+    """
+    if "/" in dataset:
+        return dataset
+    replacement = _LEGACY_DATASET_IDS.get(dataset)
+    if replacement is None:
+        return dataset
+    warnings.warn(
+        f"dataset id {dataset!r} has no namespace; using {replacement!r} instead. "
+        "Update the run config to silence this.",
+        stacklevel=3,
+    )
+    return replacement
 
 
 def load_token_stream(cfg: DataConfig, tokenizer: Any) -> np.ndarray:
@@ -36,11 +66,21 @@ def load_token_stream(cfg: DataConfig, tokenizer: Any) -> np.ndarray:
             "pip install -r requirements.txt"
         ) from exc
 
-    dataset = (
-        load_dataset(cfg.dataset, cfg.subset, split=cfg.split)
-        if cfg.subset
-        else load_dataset(cfg.dataset, split=cfg.split)
-    )
+    dataset_id = resolve_dataset_id(cfg.dataset)
+    try:
+        dataset = (
+            load_dataset(dataset_id, cfg.subset, split=cfg.split)
+            if cfg.subset
+            else load_dataset(dataset_id, split=cfg.split)
+        )
+    except Exception as exc:
+        if "namespace/name" in str(exc) or "HfUriError" in type(exc).__name__:
+            raise RuntimeError(
+                f"the installed huggingface_hub rejects the dataset id {dataset_id!r} "
+                "because it has no namespace. Set data.dataset in the run config to the "
+                "namespaced form (for WikiText-2 that is 'Salesforce/wikitext')."
+            ) from exc
+        raise
 
     text_column = "text"
     if text_column not in dataset.column_names:

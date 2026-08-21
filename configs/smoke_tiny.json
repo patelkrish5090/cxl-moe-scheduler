@@ -9,7 +9,7 @@
     "attn_implementation": "eager"
   },
   "data": {
-    "dataset": "wikitext",
+    "dataset": "Salesforce/wikitext",
     "subset": "wikitext-2-raw-v1",
     "split": "test",
     "seq_len": 128,

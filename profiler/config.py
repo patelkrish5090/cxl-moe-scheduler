@@ -56,7 +56,9 @@ class DataConfig:
     """Which corpus to run through the model.
 
     Attributes:
-        dataset: Hugging Face dataset id. WikiText-2 is the docs.md default.
+        dataset: Hugging Face dataset id, namespaced. WikiText-2 is the
+            docs.md default; the bare legacy id 'wikitext' is auto-migrated to
+            'Salesforce/wikitext' with a warning.
         subset: Dataset config name.
         split: Dataset split.
         seq_len: Tokens per sequence. Sequences are packed back-to-back from
@@ -67,7 +69,7 @@ class DataConfig:
         shuffle_documents: Shuffle documents before packing.
     """
 
-    dataset: str = "wikitext"
+    dataset: str = "Salesforce/wikitext"
     subset: str | None = "wikitext-2-raw-v1"
     split: str = "test"
     seq_len: int = 512

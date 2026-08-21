@@ -8,7 +8,7 @@
     "max_memory": {"0": "88GiB", "cpu": "150GiB"}
   },
   "data": {
-    "dataset": "wikitext",
+    "dataset": "Salesforce/wikitext",
     "subset": "wikitext-2-raw-v1",
     "split": "test",
     "seq_len": 1024,

@@ -7,7 +7,7 @@
     "attn_implementation": "sdpa"
   },
   "data": {
-    "dataset": "wikitext",
+    "dataset": "Salesforce/wikitext",
     "subset": "wikitext-2-raw-v1",
     "split": "test",
     "seq_len": 1024,
