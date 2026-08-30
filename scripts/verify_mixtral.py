@@ -73,6 +73,10 @@ def categorise(model_dir: Path) -> dict[str, list[tuple[Path, int]]]:
             continue
         size = real_size(path)
         name = path.name
+        # Downloader bookkeeping under .cache/huggingface/: zero-byte, and
+        # listing it as a deletable weight file is just noise.
+        if name.endswith((".lock", ".metadata", ".incomplete")):
+            continue
         if name.endswith(".safetensors"):
             groups["safetensors"].append((path, size))
         elif name.startswith("consolidated.") or name.endswith(".pt") or name.endswith(".bin"):
