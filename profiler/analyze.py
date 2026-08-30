@@ -271,7 +271,12 @@ def analyze_locality(
     return LocalityResult(table=pd.DataFrame(rows), n_experts=n_experts, top_k=top_k)
 
 
-def report(run_dir: str | Path, max_sites: int | None = 4, include_belady: bool = True) -> dict[str, Any]:
+def report(
+    run_dir: str | Path,
+    max_sites: int | None = 4,
+    include_belady: bool = True,
+    phase: str = "all",
+) -> dict[str, Any]:
     """Print the full locality report for a finished run.
 
     Args:
@@ -279,6 +284,11 @@ def report(run_dir: str | Path, max_sites: int | None = 4, include_belady: bool 
         max_sites: Simulate only this many layers (evenly spaced) to keep the
             runtime reasonable. None simulates every layer.
         include_belady: Whether to compute the optimal-policy bound.
+        phase: "all", "prefill", or "decode". Decode is the regime a serving
+            scheduler actually operates in -- one token at a time, touching only
+            top_k experts per layer. Prefill routes thousands of tokens through a
+            layer at once and therefore requests nearly every expert, so prefill
+            locality numbers say little about tiering.
 
     Returns:
         Dict with the computed tables, for programmatic use.
@@ -338,6 +348,15 @@ def report(run_dir: str | Path, max_sites: int | None = 4, include_belady: bool 
             if trace_path.suffix == ".parquet"
             else pd.read_csv(trace_path)
         )
+        if phase != "all":
+            want_decode = phase == "decode"
+            before = len(trace)
+            trace = trace[trace["is_decode"] == want_decode]
+            print(f"    phase filter {phase!r}: {len(trace):,} of {before:,} rows")
+            if trace.empty:
+                print(f"    no {phase} rows in this run "
+                      "(set profiler.max_new_tokens > 0 to record decode steps)")
+                return {"coverage": cov, "null": null, "locality": None}
         all_sites = sorted(trace["site_idx"].unique().tolist())
         if max_sites is not None and len(all_sites) > max_sites:
             picks = np.linspace(0, len(all_sites) - 1, max_sites).round().astype(int)

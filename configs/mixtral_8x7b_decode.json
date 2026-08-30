@@ -1,5 +1,5 @@
 {
-  "run_name": "mixtral_8x7b_wikitext2",
+  "run_name": "mixtral_8x7b_decode",
   "model": {
     "name_or_path": "mistralai/Mixtral-8x7B-v0.1",
     "dtype": "bfloat16",
@@ -11,15 +11,15 @@
     "dataset": "Salesforce/wikitext",
     "subset": "wikitext-2-raw-v1",
     "split": "test",
-    "seq_len": 1024,
-    "max_sequences": 64,
+    "seq_len": 256,
+    "max_sequences": 8,
     "batch_size": 1
   },
   "profiler": {
     "record_trace": true,
     "trace_flush_rows": 2000000,
     "cross_check_router": true,
-    "max_new_tokens": 0
+    "max_new_tokens": 256
   },
   "classify": {
     "method": "top_fraction",

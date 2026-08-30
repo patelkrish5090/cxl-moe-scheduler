@@ -5,7 +5,11 @@
 #   bash scripts/run_stage1.sh selftest   # offline correctness checks, no downloads
 #   bash scripts/run_stage1.sh smoke      # tiny untrained model, ~1 min, no big download
 #   bash scripts/run_stage1.sh olmoe      # first REAL profiling run (~14 GB download)
-#   bash scripts/run_stage1.sh mixtral    # full target model (~93 GB download)
+#   bash scripts/run_stage1.sh olmoe-decode   # decode regime, no new download
+#   bash scripts/run_stage1.sh check          # Mixtral access/size/fit preflight
+#   bash scripts/run_stage1.sh verify [dir]   # check an already-downloaded Mixtral
+#   bash scripts/run_stage1.sh mixtral        # full target model (~87 GiB download)
+#   bash scripts/run_stage1.sh mixtral-decode # Mixtral decode regime
 #
 # Environment setup is separate:  bash scripts/setup_env.sh && conda activate astera
 #
@@ -59,10 +63,37 @@ case "$CMD" in
     python -m profiler.cli run configs/olmoe_1b7b.json
     ;;
 
+  check)
+    # Gated-access + size + fit preflight. Downloads nothing.
+    python scripts/check_model_access.py "${2:-mistralai/Mixtral-8x7B-v0.1}"
+    ;;
+
+  verify)
+    # Inspect a Mixtral directory downloaded by any means: are all 19 shards
+    # present and intact, and how much of the disk is the unused consolidated
+    # copy. Loads no weights.
+    python scripts/verify_mixtral.py "${2:-models/mixtral}" --headers
+    ;;
+
+  olmoe-decode)
+    # Decode is the regime a serving scheduler actually operates in. No new
+    # download; OLMoE is already cached after `olmoe`.
+    gpu_status
+    python -m profiler.cli run configs/olmoe_decode.json
+    python -m profiler.cli analyze data/runs/olmoe_1b7b_decode --phase decode
+    ;;
+
+  mixtral-decode)
+    gpu_status
+    python -m profiler.cli run configs/mixtral_8x7b_decode.json
+    python -m profiler.cli analyze data/runs/mixtral_8x7b_decode --phase decode
+    ;;
+
   mixtral)
-    # ~93 GB in bf16 against ~98 GB of usable GPU 1. It fits only with GPU 0
-    # still occupied elsewhere and batch_size 1; if it OOMs, either wait for
-    # GPU 0 to free up and rerun with ASTERA_GPUS=0,1, or lower seq_len.
+    # 87 GiB in bf16, of which 84 GiB is expert weights (97% of the model).
+    # Against GPU 1 alone (91 GiB) that leaves ~4 GiB -- too tight, so the
+    # config caps GPU use and spills the remainder to CPU. Much better once
+    # GPU 0 is free:  ASTERA_GPUS=0,1 bash scripts/run_stage1.sh mixtral
     gpu_status
     python -m profiler.cli run configs/mixtral_8x7b.json
     ;;

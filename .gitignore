@@ -11,3 +11,6 @@ data/traces/
 
 CLAUDE.md
 docs.md
+
+models/*
+models/

@@ -89,9 +89,24 @@ def load_model_and_tokenizer(cfg: RunConfig) -> tuple[Any, Any]:
             kwargs["device_map"] = model_cfg.device_map
         if model_cfg.max_memory:
             # accelerate wants int keys for GPU indices, "cpu"/"disk" as strings.
-            kwargs["max_memory"] = {
-                (int(k) if k.isdigit() else k): v for k, v in model_cfg.max_memory.items()
-            }
+            # Drop caps for GPU indices that are not visible: CUDA_VISIBLE_DEVICES
+            # renumbers devices, so a config written for two GPUs would otherwise
+            # fail when only one is exposed.
+            n_visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            resolved: dict[Any, str] = {}
+            for key, value in model_cfg.max_memory.items():
+                if key.isdigit():
+                    if int(key) < n_visible:
+                        resolved[int(key)] = value
+                    else:
+                        print(
+                            f"      note: max_memory key {key!r} ignored, only "
+                            f"{n_visible} GPU(s) visible",
+                            flush=True,
+                        )
+                else:
+                    resolved[key] = value
+            kwargs["max_memory"] = resolved
         model = AutoModelForCausalLM.from_pretrained(model_cfg.name_or_path, **kwargs)
 
     model.eval()
