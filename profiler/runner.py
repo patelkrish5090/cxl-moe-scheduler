@@ -150,6 +150,58 @@ def _first_param_device(model: Any) -> Any:
     return torch.device("cpu")
 
 
+def _next_token_ids(
+    logits: Any,
+    cfg: RunConfig,
+    generator: Any = None,
+) -> Any:
+    """Choose the next token id per sequence from final-position logits.
+
+    Args:
+        logits: Float tensor ``[batch, vocab]`` for the last position.
+        cfg: Run config; reads ``profiler.sample/temperature/top_p``.
+        generator: Optional ``torch.Generator`` for reproducible sampling.
+
+    Returns:
+        Integer tensor ``[batch, 1]`` of chosen token ids.
+
+    Greedy decoding is the default because it is deterministic, but it makes a
+    base model prone to repetition loops, and a repeated token routes to the
+    same experts on every step -- which would make the activation trace describe
+    the loop rather than the model's routing behaviour.
+    """
+    import torch
+
+    if not cfg.profiler.sample:
+        return logits.argmax(dim=-1, keepdim=True)
+
+    scaled = logits.float() / max(cfg.profiler.temperature, 1e-6)
+    if 0.0 < cfg.profiler.top_p < 1.0:
+        ordered, order = torch.sort(scaled, descending=True, dim=-1)
+        probs = torch.softmax(ordered, dim=-1)
+        cumulative = probs.cumsum(dim=-1)
+        # Drop the tail beyond top_p, but subtract each token's own mass so the
+        # first token over the threshold is kept and no row can end up empty.
+        ordered = ordered.masked_fill(cumulative - probs > cfg.profiler.top_p, float("-inf"))
+        scaled = torch.full_like(scaled, float("-inf")).scatter(-1, order, ordered)
+    return torch.multinomial(torch.softmax(scaled, dim=-1), 1, generator=generator)
+
+
+def _sampling_generator(cfg: RunConfig, device: Any) -> Any:
+    """Build a seeded RNG on ``device``, or None when sampling is off/unseeded.
+
+    A dedicated generator keeps the run reproducible without touching the global
+    RNG state, which callers may be relying on.
+    """
+    if not cfg.profiler.sample or cfg.profiler.seed is None:
+        return None
+    import torch
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(cfg.profiler.seed))
+    return generator
+
+
 def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
     """Execute one profiling run and write its output directory.
 
@@ -226,6 +278,9 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
     )
     n_batches = int(np.ceil(sequences.shape[0] / cfg.data.batch_size))
     forward_seconds = 0.0
+    # Built lazily on the first decode step, once the logits' device is known
+    # (device_map="auto" can put the output head on a different GPU).
+    generator: Any = None
 
     with torch.no_grad(), profiler:
         for batch_idx, batch in enumerate(data.iter_batches(sequences, cfg.data.batch_size)):
@@ -239,7 +294,9 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
 
             if cfg.profiler.max_new_tokens > 0:
                 past = outputs.past_key_values
-                next_ids = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                if generator is None:
+                    generator = _sampling_generator(cfg, outputs.logits.device)
+                next_ids = _next_token_ids(outputs.logits[:, -1, :], cfg, generator)
                 for step in range(cfg.profiler.max_new_tokens):
                     profiler.begin_batch(
                         batch_size=batch_size,
@@ -253,7 +310,7 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                     )
                     forward_seconds += time.time() - t0
                     past = outputs.past_key_values
-                    next_ids = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    next_ids = _next_token_ids(outputs.logits[:, -1, :], cfg, generator)
 
             if writer is not None and profiler.pending_trace_rows() >= cfg.profiler.trace_flush_rows:
                 writer.write(profiler.take_trace())

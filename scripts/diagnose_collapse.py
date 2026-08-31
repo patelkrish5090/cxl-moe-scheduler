@@ -68,14 +68,21 @@ def routing_signatures(frame: pd.DataFrame) -> pd.DataFrame:
     """
     if frame.empty:
         return pd.DataFrame()
-    # Order matters: sort so each token's dispatches group contiguously.
-    ordered = frame.sort_values(["batch_item", "seq_pos", "layer_idx", "slot_k"])
-    key = ordered.groupby(["batch_item", "seq_pos"])["expert_id"].apply(
+    # token_uid is globally unique in issue order; batch_item is NOT a sequence
+    # id when batch_size is 1, because every sequence is then batch item 0.
+    ordered = frame.sort_values(["token_uid", "layer_idx", "slot_k"])
+    key = ordered.groupby("token_uid")["expert_id"].apply(
         lambda s: hash(tuple(s.to_numpy().tolist()))
-    )
-    key = key.reset_index(name="signature")
+    ).reset_index(name="signature")
+
+    # Recover sequence boundaries from seq_pos restarting, since consecutive
+    # token_uids run continuously across sequence ends.
+    positions = ordered.groupby("token_uid")["seq_pos"].first().reset_index(name="seq_pos")
+    key = key.merge(positions, on="token_uid").sort_values("token_uid")
+    key["seq"] = (key["seq_pos"].diff().fillna(1) <= 0).cumsum()
+
     rows = []
-    for item, group in key.groupby("batch_item"):
+    for item, group in key.groupby("seq"):
         n_positions = len(group)
         n_distinct = group["signature"].nunique()
         # Consecutive-repeat rate: the clearest fingerprint of a decode loop.
@@ -154,6 +161,41 @@ def main() -> int:
         if layers:
             print(f"    {len(layers):2d} layers {label}")
             print(f"       {layers}")
+
+    collapsed = sorted(set(verdicts["both"]) | set(verdicts["decode_only"]))
+    if collapsed:
+        print("\n[2b] WHICH EXPERTS DO THE COLLAPSED LAYERS PICK?")
+        print("    Tied router logits make torch.topk fall back to index order, so a")
+        print("    dead router always yields the LOWEST expert ids -- {0, 1} for")
+        print("    top_k=2. Layer-specific pairs instead mean the weights are real.")
+        print()
+        pairs: dict[tuple[int, ...], list[int]] = {}
+        for layer in collapsed:
+            sub = frame[frame["layer_idx"] == layer]
+            counts = np.bincount(sub["expert_id"].to_numpy(), minlength=args.experts)
+            chosen = tuple(int(e) for e in np.argsort(counts)[::-1][:2] if counts[e] > 0)
+            chosen = tuple(sorted(chosen))
+            pairs.setdefault(chosen, []).append(layer)
+            print(f"    layer {layer:3d} -> experts {chosen}")
+        print()
+        lowest = tuple(range(2))
+        if set(pairs) == {lowest}:
+            print(f"    ALL collapsed layers pick {lowest}, the lowest ids.")
+            print("    -> Router logits are TIED, i.e. those gates are dead. This is a")
+            print("       loading or checkpoint fault, not Mixtral's real routing.")
+            print("       Run: python scripts/inspect_routers.py <model_dir>")
+        elif len(pairs) == 1:
+            only = next(iter(pairs))
+            print(f"    All collapsed layers pick the same pair {only}, but it is not")
+            print(f"    {lowest}. Unusual: consistent with a shared upstream cause")
+            print("    rather than index tie-breaking.")
+        else:
+            print(f"    {len(pairs)} distinct pairs across {len(collapsed)} layers:")
+            for pair, layers in sorted(pairs.items()):
+                print(f"      {pair}: layers {layers}")
+            print("    -> Layer-specific pairs mean the gates hold real, distinct")
+            print("       weights. The collapse is genuine routing behaviour, however")
+            print("       extreme it looks.")
 
     print("\n[3] IS THE GENERATED TEXT DEGENERATE?")
     print("    Distinct whole-model routing signatures per generated position.")

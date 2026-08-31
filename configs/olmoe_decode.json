@@ -18,7 +18,11 @@
     "record_trace": true,
     "trace_flush_rows": 2000000,
     "cross_check_router": true,
-    "max_new_tokens": 256
+    "max_new_tokens": 256,
+    "sample": true,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "seed": 1234
   },
   "classify": {
     "method": "top_fraction",

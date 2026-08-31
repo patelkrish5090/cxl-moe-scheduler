@@ -96,12 +96,29 @@ class ProfilerConfig:
         max_new_tokens: 0 profiles a pure prefill/teacher-forced forward pass
             (what docs.md 4.1 describes). >0 additionally profiles autoregressive
             decode steps, which is the regime stage 3 schedules for.
+        sample: If True, draw each decode token from the softmax instead of
+            taking the argmax. Greedy decoding is deterministic, but a base
+            model run for a few hundred steps frequently falls into a repetition
+            loop; a repeated token routes to the same experts every step, so the
+            trace ends up measuring the loop rather than serving behaviour.
+            Ignored when max_new_tokens is 0.
+        temperature: Softmax temperature for sampling. 1.0 is the model's own
+            distribution; lower is closer to greedy.
+        top_p: Nucleus sampling cutoff. Restricts each draw to the smallest set
+            of tokens whose cumulative probability reaches this value. 1.0
+            disables it.
+        seed: Seed for the sampling RNG, so a sampled run is reproducible.
+            None leaves the ambient RNG state alone.
     """
 
     record_trace: bool = True
     trace_flush_rows: int = 200_000
     cross_check_router: bool = True
     max_new_tokens: int = 0
+    sample: bool = False
+    temperature: float = 1.0
+    top_p: float = 1.0
+    seed: int | None = None
 
 
 @dataclass
