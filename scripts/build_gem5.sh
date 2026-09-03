@@ -3,7 +3,11 @@
 #
 #   bash scripts/build_gem5.sh                 # full build, ~30-60 min
 #   bash scripts/build_gem5.sh check           # prerequisites only, no download
+#   bash scripts/build_gem5.sh zlib            # diagnose the zlib/conda clash
 #   bash scripts/build_gem5.sh verify          # is an existing build usable?
+#
+# Override the interpreter gem5 embeds with ASTERA_PYTHON_CONFIG=/path/to/
+# python3-config if the automatic choice is wrong.
 #
 # Downloads ~10 GB into third_party/ (gitignored). Nothing here touches the
 # model weights or the profiler.
@@ -30,6 +34,108 @@ JOBS="${ASTERA_BUILD_JOBS:-$(nproc 2>/dev/null || echo 8)}"
 info()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn()  { printf '\033[33mWARNING: %s\033[0m\n' "$*"; }
 die()   { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------------ zlib probe
+# gem5's scons checks zlib by compiling and linking a test program, and it does
+# so with the flags `python3-config --ldflags` hands it. When a conda env is
+# active that puts the env's lib/ ahead of /usr/lib on the link line, so a
+# perfectly good system zlib1g-dev is never reached and the check fails with
+# "Checking for C++ library z... no". Reinstalling the system package cannot fix
+# that, which is why this probe reports the real compiler error instead.
+#
+# Returns 0 if the test links with the given extra flags.
+probe_zlib() {
+  local extra_flags="$1"
+  local tmp
+  tmp="$(mktemp -d)"
+  cat > "$tmp/z.cc" <<'ZTEST'
+#include <zlib.h>
+int main() { zlibVersion(); return 0; }
+ZTEST
+  # shellcheck disable=SC2086 -- extra_flags is deliberately word-split
+  if g++ "$tmp/z.cc" -o "$tmp/z" $extra_flags -lz > "$tmp/err" 2>&1; then
+    rm -rf "$tmp"
+    return 0
+  fi
+  ZLIB_PROBE_ERROR="$(cat "$tmp/err")"
+  rm -rf "$tmp"
+  return 1
+}
+
+# Which python3-config should gem5 build against? gem5 embeds a Python
+# interpreter, and memsim invokes gem5.opt as a subprocess, so it does NOT need
+# to be the same interpreter as the conda env the profiler runs in. When conda's
+# Python breaks the zlib link, the system Python is the right answer.
+resolve_python_config() {
+  if [ -n "${ASTERA_PYTHON_CONFIG:-}" ]; then
+    PYTHON_CONFIG_CHOICE="$ASTERA_PYTHON_CONFIG"
+    PYTHON_CONFIG_REASON="ASTERA_PYTHON_CONFIG was set"
+    return
+  fi
+
+  local active_cfg="" system_cfg=""
+  active_cfg="$(command -v python3-config || true)"
+  for candidate in /usr/bin/python3-config /usr/bin/python3.12-config \
+                   /usr/bin/python3.11-config /usr/bin/python3.10-config; do
+    [ -x "$candidate" ] && { system_cfg="$candidate"; break; }
+  done
+
+  # Does the currently-selected Python's link environment find zlib?
+  local active_ldflags=""
+  [ -n "$active_cfg" ] && active_ldflags="$("$active_cfg" --ldflags 2>/dev/null || true)"
+
+  if [ -n "$active_cfg" ] && probe_zlib "$active_ldflags"; then
+    PYTHON_CONFIG_CHOICE="$active_cfg"
+    PYTHON_CONFIG_REASON="its link environment finds zlib"
+    return
+  fi
+
+  # It does not. Fall back to the system Python if that one works.
+  if [ -n "$system_cfg" ] && [ "$system_cfg" != "$active_cfg" ]; then
+    local system_ldflags
+    system_ldflags="$("$system_cfg" --ldflags 2>/dev/null || true)"
+    if probe_zlib "$system_ldflags"; then
+      PYTHON_CONFIG_CHOICE="$system_cfg"
+      PYTHON_CONFIG_REASON="the active (conda) Python's lib/ shadows the system zlib; this one links"
+      return
+    fi
+  fi
+
+  PYTHON_CONFIG_CHOICE=""
+  PYTHON_CONFIG_REASON="no python3-config produced a working zlib link"
+}
+
+check_zlib() {
+  printf '\n'
+  if probe_zlib ""; then
+    printf '  %-10s links with a bare g++ -lz -- ok\n' "zlib"
+  else
+    printf '  %-10s DOES NOT LINK even with no extra flags:\n' "zlib"
+    printf '%s\n' "$ZLIB_PROBE_ERROR" | sed 's/^/      /'
+    printf '      -> install the development package: sudo apt install zlib1g-dev\n'
+    return 1
+  fi
+
+  resolve_python_config
+  if [ -z "$PYTHON_CONFIG_CHOICE" ]; then
+    printf '  %-10s no usable python3-config (%s)\n' "python" "$PYTHON_CONFIG_REASON"
+    printf '      Last error:\n'
+    printf '%s\n' "${ZLIB_PROBE_ERROR:-none}" | sed 's/^/      /'
+    printf '      If the system Python is the problem: sudo apt install python3-dev\n'
+    return 1
+  fi
+  printf '  %-10s %s\n' "py-config" "$PYTHON_CONFIG_CHOICE"
+  printf '  %-10s %s\n' "" "($PYTHON_CONFIG_REASON)"
+
+  if [ -n "${CONDA_PREFIX:-}" ] && [[ "$PYTHON_CONFIG_CHOICE" != "$CONDA_PREFIX"* ]]; then
+    printf '\n'
+    warn "conda env '${CONDA_DEFAULT_ENV:-?}' is active but gem5 will be built against"
+    warn "the SYSTEM Python instead. That is fine and intended: gem5 embeds its own"
+    warn "interpreter and memsim runs gem5.opt as a subprocess, so it never needs to"
+    warn "share the conda environment."
+  fi
+  return 0
+}
 
 # ---------------------------------------------------------------- prerequisites
 check_prereqs() {
@@ -90,6 +196,12 @@ check_prereqs() {
   if [ ${#missing[@]} -gt 0 ]; then
     die "missing prerequisites: ${missing[*]}"
   fi
+
+  # zlib is checked last and separately because it is the one that fails two
+  # minutes INTO the build rather than at the start, and because the fix is
+  # never "install zlib" when a conda env is in the way.
+  check_zlib || die "zlib/python configuration is not usable; see above"
+
   printf '\n  All prerequisites present.\n'
 }
 
@@ -160,12 +272,28 @@ build_dramsim3() {
 
 # ------------------------------------------------------------------- build gem5
 build_gem5() {
+  # Pick the interpreter before doing anything expensive: gem5 caches its
+  # configure results, so switching PYTHON_CONFIG later means a full rebuild.
+  resolve_python_config
+  [ -n "$PYTHON_CONFIG_CHOICE" ] || die "no usable python3-config ($PYTHON_CONFIG_REASON)"
+
   info "Building gem5 ($GEM5_ARCH, -j$JOBS) -- 30 to 60 minutes"
+  printf '  python-config %s\n' "$PYTHON_CONFIG_CHOICE"
+  printf '  reason        %s\n' "$PYTHON_CONFIG_REASON"
   printf '  Log: %s\n' "$THIRD_PARTY/gem5_build.log"
+
   (
     cd "$GEM5_DIR"
+    # Two levers, because gem5 uses both. The build log line
+    #   "Info: Using Python config: python3-config"
+    # shows it resolves the tool from PATH, so putting the chosen one first is
+    # what actually takes effect; PYTHON_CONFIG is set as well for the gem5
+    # versions that read it as a scons variable. Whichever mechanism this gem5
+    # honours, both now point at the same interpreter.
+    export PATH="$(dirname "$PYTHON_CONFIG_CHOICE"):$PATH"
     # --ignore-style skips the pre-commit style hooks, which otherwise prompt.
-    scons "build/$GEM5_ARCH/gem5.opt" -j"$JOBS" --ignore-style 2>&1 \
+    scons "build/$GEM5_ARCH/gem5.opt" -j"$JOBS" --ignore-style \
+      "PYTHON_CONFIG=$PYTHON_CONFIG_CHOICE" 2>&1 \
       | tee "$THIRD_PARTY/gem5_build.log"
   )
   [ -x "$GEM5_BINARY" ] || die "build finished but $GEM5_BINARY is missing"
@@ -211,6 +339,11 @@ PROBE
 # ------------------------------------------------------------------------ main
 case "${1:-all}" in
   check)     check_prereqs ;;
+  zlib)
+    # Just the zlib/python diagnosis, for when the build fails at
+    # "Checking for C++ library z... no".
+    check_zlib
+    ;;
   fetch)     check_prereqs; fetch_gem5; fetch_dramsim3 ;;
   dramsim3)  build_dramsim3 ;;
   gem5)      build_gem5; verify_build ;;
