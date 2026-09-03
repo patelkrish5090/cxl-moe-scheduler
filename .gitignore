@@ -14,3 +14,12 @@ docs.md
 
 models/*
 models/
+
+# gem5 + DRAMSim3 source and build tree (~10 GB), fetched by
+# scripts/build_gem5.sh. The pinned versions are recorded in memsim/README.md;
+# the tree itself is never committed.
+third_party/
+
+# gem5 run output: stats.txt, config.ini and DRAMSim3's own dumps, one
+# directory per simulated point. Regenerate with memsim/run_sweep.py.
+memsim/out/
