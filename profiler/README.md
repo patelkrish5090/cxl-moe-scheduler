@@ -34,10 +34,14 @@ python tests/test_runner_integration.py               # end-to-end, no downloads
 python -m profiler.cli run configs/olmoe_1b7b.json    # a real profiling run
 python -m profiler.cli inspect data/runs/<name>       # re-print a run's summary
 python -m profiler.cli reclassify data/runs/<name> --method coverage --value 0.9
+python -m profiler.cli analyze data/runs/<name> --phase decode --max-sites 0
 ```
 
 `reclassify` re-splits hot/cold at a new threshold from the saved counts, so
 sweeping thresholds never requires re-running the model.
+
+`analyze` measures temporal locality — see [Locality and the layer
+split](#locality-and-the-layer-split).
 
 ## Running on the HPC box
 
@@ -156,6 +160,50 @@ near-uniformly. The integration test measures normalised entropy ≈ 0.99 on a
 random-weight Mixtral, which is the expected control. Runs made this way get a
 caveat written into `run_metadata.json["notes"]`; never cite their skew as
 evidence.
+
+## Locality and the layer split
+
+`python -m profiler.cli analyze data/runs/<name>` answers the question the
+histogram cannot: not *which* experts are used most, but whether the experts a
+token needs are the ones the previous tokens needed. It compares three policies
+at each cache size — static pinning by frequency, LRU, and Belady MIN — and the
+`LRU-static` column is what runtime adaptation is worth, i.e. what stage 3's
+scheduler has to beat.
+
+Layers are not interchangeable in that measurement. A layer whose **working set**
+— the fewest experts covering 99 % of its dispatches — is no larger than `top_k`
+is fully resident in the smallest cache worth simulating, so every policy scores
+~100 % on it at every capacity. Those layers are **cache-trivial**. They are real
+routing behaviour, not an error, but averaging them into the policy comparison
+pulls every policy toward 100 % and shrinks the measured `LRU-static` gap without
+carrying any information about placement.
+
+`analyze` therefore prints the layer classification (section `[2]`) and then the
+locality comparison for both groups. Use `--layers`:
+
+| value | tables printed |
+| --- | --- |
+| `both` (default) | all layers, then diverse layers only |
+| `all` | every layer, averaged together |
+| `diverse` | only layers with a working set larger than `top_k` |
+| `trivial` | only the cache-trivial layers |
+
+Mixtral-8x7B-v0.1 is the motivating case: layers 1–15 route every token to
+experts 0 and 1 in both prefill and decode. `scripts/inspect_routers.py
+models/mixtral --load` confirmed this is genuine — the routers load with zero
+missing keys and non-degenerate weights — so those layers are cache-trivial by
+nature and the diverse-layer table is the one to quote.
+
+Two flags interact with this:
+
+- `--phase decode` restricts to autoregressive decode, the regime a serving
+  scheduler operates in. It also recomputes the dispatch counts from the filtered
+  trace, so skew, coverage and locality all describe the same tokens rather than
+  mixing phase-local traffic with run-wide frequencies.
+- `--max-sites 0` simulates every layer instead of an evenly-spaced sample of 4.
+  Each layer group is subsampled independently, so with a small `--max-sites` the
+  two tables are averages over different layer samples — compare them as
+  populations, not row by row.
 
 ## Threshold methods
 

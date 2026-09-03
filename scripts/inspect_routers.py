@@ -170,12 +170,20 @@ def compare_expected_keys(model_dir: Path, weight_map: dict[str, str]) -> None:
     print(f"  router tensors -- model expects {len(exp_routers)}, "
           f"checkpoint has {len(ckpt_routers)}")
 
+    print()
+    print("  CAVEAT: this is a NAME diff, not a load. transformers 5.x rewires MoE")
+    print("  modules during from_pretrained (renaming and fusing expert weights) by")
+    print("  more than the declared conversion mapping, so names that look absent")
+    print("  here are often loaded correctly anyway. Treat a mismatch below as a")
+    print("  lead to check, and section [3] --load as the authoritative answer.")
+
     missing_routers = sorted(exp_routers - ckpt_routers)
     if missing_routers:
         print()
-        print(f"  {len(missing_routers)} ROUTER TENSORS THE MODEL EXPECTS ARE NOT IN THE")
-        print("  CHECKPOINT. transformers will initialize these itself, so those")
-        print("  layers route on untrained weights:")
+        print(f"  {len(missing_routers)} router tensors the model expects are absent under")
+        print("  those names. IF this is a real mismatch, transformers initializes them")
+        print("  itself and those layers route on untrained weights -- but confirm with")
+        print("  --load before believing it:")
         for key in missing_routers[:8]:
             print(f"    {key}")
         if len(missing_routers) > 8:

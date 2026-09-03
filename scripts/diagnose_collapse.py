@@ -181,9 +181,14 @@ def main() -> int:
         lowest = tuple(range(2))
         if set(pairs) == {lowest}:
             print(f"    ALL collapsed layers pick {lowest}, the lowest ids.")
-            print("    -> Router logits are TIED, i.e. those gates are dead. This is a")
-            print("       loading or checkpoint fault, not Mixtral's real routing.")
-            print("       Run: python scripts/inspect_routers.py <model_dir>")
+            print("    -> CONSISTENT WITH tied router logits (dead gates), but NOT proof")
+            print("       of it: a checkpoint can also genuinely favour the first two")
+            print("       experts. This test cannot tell those apart. Settle it by")
+            print("       reading the weights:")
+            print("         python scripts/inspect_routers.py <model_dir> --load")
+            print("       On Mixtral-8x7B-v0.1 that came back clean -- routers load with")
+            print("       zero missing keys and non-degenerate weights -- so there the")
+            print("       collapse in layers 1-15 is real routing, not a loading fault.")
         elif len(pairs) == 1:
             only = next(iter(pairs))
             print(f"    All collapsed layers pick the same pair {only}, but it is not")

@@ -105,7 +105,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
     max_sites = args.max_sites if args.max_sites and args.max_sites > 0 else None
     report(args.run_dir, max_sites=max_sites, include_belady=not args.no_belady,
-           phase=args.phase)
+           phase=args.phase, layer_set=args.layers)
     return 0
 
 
@@ -147,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_an.add_argument("--no-belady", action="store_true", help="skip the optimal-policy bound")
     p_an.add_argument("--phase", default="all", choices=["all", "prefill", "decode"],
                       help="which tokens to simulate; decode is the serving regime")
+    p_an.add_argument("--layers", default="both",
+                      choices=["both", "all", "diverse", "trivial"],
+                      help="which layer group gets a locality table; layers whose "
+                           "working set fits in top_k experts are cache-trivial and "
+                           "score ~100%% under every policy (default: both)")
     p_an.set_defaults(func=_cmd_analyze)
 
     p_self = sub.add_parser("selftest", help="run the offline plumbing test (no downloads)")

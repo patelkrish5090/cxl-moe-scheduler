@@ -80,13 +80,18 @@ case "$CMD" in
     # download; OLMoE is already cached after `olmoe`.
     gpu_status
     python -m profiler.cli run configs/olmoe_decode.json
-    python -m profiler.cli analyze data/runs/olmoe_1b7b_decode --phase decode
+    # --max-sites 0 simulates every layer; --layers both reports the policy
+    # comparison with and without the layers whose working set already fits in
+    # top_k experts (those score ~100% under any policy and dilute the average).
+    python -m profiler.cli analyze data/runs/olmoe_1b7b_decode \
+      --phase decode --max-sites 0 --layers both
     ;;
 
   mixtral-decode)
     gpu_status
     python -m profiler.cli run configs/mixtral_8x7b_decode.json
-    python -m profiler.cli analyze data/runs/mixtral_8x7b_decode --phase decode
+    python -m profiler.cli analyze data/runs/mixtral_8x7b_decode \
+      --phase decode --max-sites 0 --layers both
     ;;
 
   mixtral)
