@@ -87,9 +87,11 @@ def inspect_checkpoint(model_dir: Path) -> dict[str, str]:
     for layer, keys in router_keys.items():
         for key in keys:
             shard = model_dir / weight_map[key]
-            with safe_open(shard, framework="np") as handle:
+            # framework="np" errors on bfloat16 (numpy has no such dtype); read via
+            # torch and convert, which handles every dtype safetensors stores.
+            with safe_open(shard, framework="pt") as handle:
                 tensor = handle.get_tensor(key)
-            values = tensor.astype(np.float32)
+            values = tensor.float().numpy()
             norm = float(np.linalg.norm(values))
             std = float(values.std())
             # If every expert's row is the same, all logits tie regardless of
