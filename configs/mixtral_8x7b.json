@@ -3,9 +3,8 @@
   "model": {
     "name_or_path": "models/mixtral",
     "dtype": "bfloat16",
-    "device_map": "auto",
-    "attn_implementation": "eager",
-    "max_memory": {"0": "80GiB", "1": "80GiB", "cpu": "150GiB"}
+    "device_map": "cuda:0",
+    "attn_implementation": "eager"
   },
   "data": {
     "dataset": "Salesforce/wikitext",
