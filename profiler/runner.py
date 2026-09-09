@@ -332,11 +332,22 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
             # pipeline's packed sequences, so the mask is always all-ones.
             attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
 
+            # cache_position is likewise passed explicitly rather than left for the
+            # model to infer from past_key_values.get_seq_length(): under
+            # device_map="auto" splitting layers across multiple GPUs, that
+            # inference is exactly the kind of implicit cross-device state that
+            # can drift, and RoPE position embeddings depend on it being exactly
+            # right -- a wrong position degrades attention progressively rather
+            # than failing outright, which matches corruption that gets worse
+            # decode step over decode step instead of failing immediately.
+            cache_position = torch.arange(seq_len, device=device)
+
             profiler.begin_batch(batch_size=batch_size, seq_len=seq_len, phase="prefill")
             t0 = time.time()
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                cache_position=cache_position,
                 use_cache=cfg.profiler.max_new_tokens > 0,
             )
             forward_seconds += time.time() - t0
@@ -348,7 +359,7 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                 next_ids = _next_token_ids(
                     outputs.logits[:, -1, :], cfg, generator,
                     step_label="prefill", nonfinite_stats=nonfinite_stats,
-                )
+                ).to(device)
                 for step in range(cfg.profiler.max_new_tokens):
                     profiler.begin_batch(
                         batch_size=batch_size,
@@ -359,10 +370,12 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                     attention_mask = torch.cat(
                         [attention_mask, attention_mask.new_ones((batch_size, 1))], dim=-1
                     )
+                    cache_position = cache_position[-1:] + 1
                     t0 = time.time()
                     outputs = model(
                         input_ids=next_ids,
                         attention_mask=attention_mask,
+                        cache_position=cache_position,
                         past_key_values=past,
                         use_cache=True,
                     )
@@ -371,7 +384,7 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                     next_ids = _next_token_ids(
                         outputs.logits[:, -1, :], cfg, generator,
                         step_label=f"decode step {step}", nonfinite_stats=nonfinite_stats,
-                    )
+                    ).to(device)
 
             if writer is not None and profiler.pending_trace_rows() >= cfg.profiler.trace_flush_rows:
                 writer.write(profiler.take_trace())
