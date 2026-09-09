@@ -304,9 +304,23 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
             input_ids = torch.from_numpy(batch).to(device)
             batch_size, seq_len = input_ids.shape
 
+            # Passed explicitly (never left to the model to infer) because with
+            # device_map="auto" splitting layers across multiple GPUs, letting
+            # attention_mask default to None for the single-token decode calls
+            # below produced NaN/inf logits from decode step 0 onward -- the
+            # incremental (cached) forward path needs an explicit mask covering
+            # the full cache length, not just the new token, to build a correct
+            # causal mask across device boundaries. No padding exists in this
+            # pipeline's packed sequences, so the mask is always all-ones.
+            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
+
             profiler.begin_batch(batch_size=batch_size, seq_len=seq_len, phase="prefill")
             t0 = time.time()
-            outputs = model(input_ids=input_ids, use_cache=cfg.profiler.max_new_tokens > 0)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=cfg.profiler.max_new_tokens > 0,
+            )
             forward_seconds += time.time() - t0
 
             if cfg.profiler.max_new_tokens > 0:
@@ -323,9 +337,15 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                         phase="decode",
                         position_offset=seq_len + step,
                     )
+                    attention_mask = torch.cat(
+                        [attention_mask, attention_mask.new_ones((batch_size, 1))], dim=-1
+                    )
                     t0 = time.time()
                     outputs = model(
-                        input_ids=next_ids, past_key_values=past, use_cache=True
+                        input_ids=next_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=past,
+                        use_cache=True,
                     )
                     forward_seconds += time.time() - t0
                     past = outputs.past_key_values
