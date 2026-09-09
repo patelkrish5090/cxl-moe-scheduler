@@ -278,9 +278,9 @@ def main() -> int:
           len({p.device_config.name for p in points}) == 2,
           f"got {sorted({p.device_config.name for p in points})}")
 
-    hbm_cmd = command_for(points[0], Path("/fake/gem5.opt"), 1024)
+    hbm_cmd = command_for(points[0], Path("/fake/gem5.opt"), 1024, fake_third_party)
     cxl_point = next(p for p in points if p.tier == "cxl")
-    cxl_cmd = command_for(cxl_point, Path("/fake/gem5.opt"), 1024)
+    cxl_cmd = command_for(cxl_point, Path("/fake/gem5.opt"), 1024, fake_third_party)
     check("--link-latency-ns is passed only for the cxl tier",
           "--link-latency-ns" not in hbm_cmd and "--link-latency-ns" in cxl_cmd)
     check("the outdir is passed to gem5, not to the config script",

@@ -158,14 +158,18 @@ def build_points(
     return points
 
 
-def command_for(point: SweepPoint, gem5: Path, transfer_bytes: int) -> list[str]:
+def command_for(
+    point: SweepPoint, gem5: Path, transfer_bytes: int, third_party: Path
+) -> list[str]:
     """The exact argv for one gem5 invocation."""
+    dramsim_dir = third_party / "gem5" / "ext" / "dramsim3" / "DRAMsim3"
     argv = [
         str(gem5),
         f"--outdir={point.outdir}",
         str(TIER_CONFIG),
         "--tier", point.tier,
         "--dramsim-config", str(point.device_config),
+        "--dramsim-path", str(dramsim_dir),
         "--injection-period-ps", str(point.injection_period_ps),
         "--transfer-bytes", str(transfer_bytes),
     ]
@@ -215,7 +219,7 @@ def run_sweep(
             print(f"NOTE: {note}\n")
         print(f"{len(points)} gem5 invocations:\n")
         for point in points:
-            argv = command_for(point, Path(gem5_display), transfer_bytes)
+            argv = command_for(point, Path(gem5_display), transfer_bytes, third_party)
             print("  " + " ".join(argv))
         if link_latency_ns == 0.0 and "cxl" in tiers:
             print("\nNOTE: --link-latency-ns was not given, so the cxl points above show 0,")
@@ -226,7 +230,7 @@ def run_sweep(
     gem5 = find_gem5(third_party)
     for i, point in enumerate(points, 1):
         point.outdir.mkdir(parents=True, exist_ok=True)
-        argv = command_for(point, gem5, transfer_bytes)
+        argv = command_for(point, gem5, transfer_bytes, third_party)
         print(f"\n[{i}/{len(points)}] {point.label}  "
               f"({point.device_config.name}, period {point.injection_period_ps} ps)")
         print("  " + " ".join(argv))
