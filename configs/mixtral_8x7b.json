@@ -1,7 +1,7 @@
 {
   "run_name": "mixtral_8x7b_wikitext2",
   "model": {
-    "name_or_path": "mistralai/Mixtral-8x7B-v0.1",
+    "name_or_path": "models/mixtral",
     "dtype": "bfloat16",
     "device_map": "auto",
     "attn_implementation": "sdpa",
