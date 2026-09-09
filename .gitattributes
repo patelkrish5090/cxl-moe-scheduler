@@ -1,0 +1,4 @@
+# Force LF regardless of what OS/editor touches the repo. A prior commit
+# (6dcf8a2) saved several files with CRLF, which breaks `set -o pipefail` in
+# shell scripts on the Linux server ("pipefail\r: invalid option name").
+* text=auto eol=lf
