@@ -52,6 +52,7 @@ import m5
 from m5.objects import (
     AddrRange,
     Bridge,
+    IOXBar,
     PyTrafficGen,
     Root,
     SrcClockDomain,
@@ -145,15 +146,21 @@ def main() -> None:
     system.mem_ranges = [AddrRange(args.mem_size)]
 
     system.generator = PyTrafficGen()
+    system.membus = IOXBar()
+    system.generator.port = system.membus.cpu_side_ports
+    # Required by gem5's System even though nothing here exercises functional
+    # (non-timing) accesses: configs/dram/sweep.py, gem5's own reference DRAM
+    # characterisation script, connects this explicitly with the comment
+    # "connect the system port even if it is not used in this example". Leaving
+    # it unconnected is why every point stalled with BaseTrafficGen "spent ...
+    # ticks without making progress" regardless of memory model, injection
+    # rate, or crossbar topology -- all of which were tried and ruled out first.
+    system.system_port = system.membus.cpu_side_ports
 
     system.mem_ctrl = attach_dramsim(
         args.dramsim_config, args.dramsim_path, system.mem_ranges[0]
     )
 
-    # A single generator talking to a single memory needs no crossbar --
-    # that's multiplexing hardware for arbitrating between multiple ports,
-    # and it's not needed (or exercised) here. Connect point-to-point,
-    # inserting the link Bridge directly for the cxl tier.
     if args.tier == "cxl":
         # A Bridge with a fixed delay is the simplest honest stand-in for the
         # link: it charges every request and every response the configured
@@ -162,12 +169,14 @@ def main() -> None:
             delay=f"{args.link_latency_ns}ns",
             ranges=system.mem_ranges,
         )
-        system.generator.port = system.link.cpu_side_port
-        system.link.mem_side_port = system.mem_ctrl.port
+        system.membus.mem_side_ports = system.link.cpu_side_port
+        system.linkbus = IOXBar()
+        system.link.mem_side_port = system.linkbus.cpu_side_ports
+        system.linkbus.mem_side_ports = system.mem_ctrl.port
         print(f"[tier.py] cxl tier: {args.link_latency_ns} ns one-way link delay "
               f"({2 * args.link_latency_ns} ns round trip)")
     else:
-        system.generator.port = system.mem_ctrl.port
+        system.membus.mem_side_ports = system.mem_ctrl.port
         print("[tier.py] hbm tier: direct attach, no link delay")
 
     end_addr = min(int(AddrRange(args.mem_size).size()), args.transfer_bytes)
