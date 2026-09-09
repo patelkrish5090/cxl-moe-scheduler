@@ -3,7 +3,8 @@
 #
 #   bash scripts/build_gem5.sh                 # full build, ~30-60 min
 #   bash scripts/build_gem5.sh check           # prerequisites only, no download
-#   bash scripts/build_gem5.sh zlib            # diagnose the zlib/conda clash
+#   bash scripts/build_gem5.sh zlib            # quick zlib/python link probe
+#   bash scripts/build_gem5.sh diagnose        # full dump + gem5's configure log
 #   bash scripts/build_gem5.sh verify          # is an existing build usable?
 #
 # Override the interpreter gem5 embeds with ASTERA_PYTHON_CONFIG=/path/to/
@@ -343,6 +344,69 @@ case "${1:-all}" in
     # Just the zlib/python diagnosis, for when the build fails at
     # "Checking for C++ library z... no".
     check_zlib
+    ;;
+
+  diagnose)
+    # scons reports a failed configure check as a bare "no" and throws the real
+    # compiler output into a log. gem5 runs its zlib check AFTER appending the
+    # Python interpreter's include and library flags, so a failure attributed to
+    # zlib can actually be the Python link failing. This dumps everything needed
+    # to tell those apart.
+    info "python3-config in use"
+    pycfg="$(command -v python3-config || echo none)"
+    printf '  path      %s\n' "$pycfg"
+    if [ "$pycfg" != "none" ]; then
+      printf '  --includes %s\n' "$("$pycfg" --includes 2>&1)"
+      printf '  --ldflags  %s\n' "$("$pycfg" --ldflags 2>&1)"
+      printf '  --libs     %s\n' "$("$pycfg" --libs 2>&1)"
+      printf '  --ldflags --embed  %s\n' "$("$pycfg" --ldflags --embed 2>&1 || echo '(unsupported)')"
+    fi
+
+    info "libz visible to the linker"
+    for dir in "${CONDA_PREFIX:-/nonexistent}/lib" /usr/lib/x86_64-linux-gnu /usr/lib64; do
+      [ -d "$dir" ] || continue
+      printf '  %s:\n' "$dir"
+      ls -la "$dir"/libz.so* 2>/dev/null | sed 's/^/    /' || printf '    (no libz here)\n'
+    done
+    info "zlib.h visible to the compiler"
+    for dir in "${CONDA_PREFIX:-/nonexistent}/include" /usr/include; do
+      [ -f "$dir/zlib.h" ] && printf '  %s/zlib.h  (version %s)\n' "$dir" \
+        "$(grep -m1 ZLIB_VERSION "$dir/zlib.h" | tr -d '\r')"
+    done
+
+    info "Reproducing gem5's own check, with the Python flags it adds"
+    tmp="$(mktemp -d)"
+    cat > "$tmp/z.cc" <<'ZTEST'
+#include <zlib.h>
+int main() { zlibVersion(); return 0; }
+ZTEST
+    if [ "$pycfg" != "none" ]; then
+      inc="$("$pycfg" --includes 2>/dev/null)"
+      ldf="$("$pycfg" --ldflags 2>/dev/null)"
+      printf '  g++ %s %s -lz\n' "$inc" "$ldf"
+      # shellcheck disable=SC2086
+      if g++ "$tmp/z.cc" -o "$tmp/z" $inc $ldf -lz 2>"$tmp/err"; then
+        printf '    LINKS OK -- so the failure is not this combination alone\n'
+      else
+        printf '    FAILED:\n'
+        sed 's/^/      /' "$tmp/err"
+      fi
+    fi
+    rm -rf "$tmp"
+
+    info "gem5's configure log (the authoritative error)"
+    found=0
+    while IFS= read -r log; do
+      found=1
+      printf '\n  --- %s (last 60 lines) ---\n' "$log"
+      tail -60 "$log" | sed 's/^/  /'
+    done < <(find "$GEM5_DIR/build" -maxdepth 3 \
+               \( -name 'config.log' -o -name '*config*.log' \) 2>/dev/null)
+    if [ "$found" -eq 0 ]; then
+      warn "no scons config log found under $GEM5_DIR/build"
+      warn "Force a fresh configure so one is written:"
+      warn "  rm -rf $GEM5_DIR/build/$GEM5_ARCH && bash scripts/build_gem5.sh gem5"
+    fi
     ;;
   fetch)     check_prereqs; fetch_gem5; fetch_dramsim3 ;;
   dramsim3)  build_dramsim3 ;;
