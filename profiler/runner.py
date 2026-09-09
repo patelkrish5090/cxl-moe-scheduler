@@ -154,6 +154,7 @@ def _next_token_ids(
     logits: Any,
     cfg: RunConfig,
     generator: Any = None,
+    step_label: str = "",
 ) -> Any:
     """Choose the next token id per sequence from final-position logits.
 
@@ -161,6 +162,7 @@ def _next_token_ids(
         logits: Float tensor ``[batch, vocab]`` for the last position.
         cfg: Run config; reads ``profiler.sample/temperature/top_p``.
         generator: Optional ``torch.Generator`` for reproducible sampling.
+        step_label: Human-readable phase/step, used only in the NaN error below.
 
     Returns:
         Integer tensor ``[batch, 1]`` of chosen token ids.
@@ -171,6 +173,21 @@ def _next_token_ids(
     the loop rather than the model's routing behaviour.
     """
     import torch
+
+    # A NaN/inf here comes from the model's own forward pass, not from sampling.
+    # Surfacing it immediately, with the step that produced it, beats the
+    # `torch.multinomial` assertion three frames later: that error is an async
+    # CUDA device-side assert whose reported stack trace can be wrong (PyTorch's
+    # own warning), so it never actually names which forward call was at fault.
+    bad = torch.isnan(logits) | torch.isinf(logits)
+    if bad.any():
+        raise RuntimeError(
+            f"non-finite logits at {step_label or 'this step'}: "
+            f"{int(torch.isnan(logits).sum())} NaN, "
+            f"{int(torch.isinf(logits).sum())} inf out of {logits.numel()} values. "
+            "This is a model forward-pass bug (numerics or device_map sharding), "
+            "not a sampling bug -- see profiler/runner.py::_next_token_ids."
+        )
 
     if not cfg.profiler.sample:
         return logits.argmax(dim=-1, keepdim=True)
@@ -296,7 +313,9 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                 past = outputs.past_key_values
                 if generator is None:
                     generator = _sampling_generator(cfg, outputs.logits.device)
-                next_ids = _next_token_ids(outputs.logits[:, -1, :], cfg, generator)
+                next_ids = _next_token_ids(
+                    outputs.logits[:, -1, :], cfg, generator, step_label="prefill"
+                )
                 for step in range(cfg.profiler.max_new_tokens):
                     profiler.begin_batch(
                         batch_size=batch_size,
@@ -310,7 +329,10 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                     )
                     forward_seconds += time.time() - t0
                     past = outputs.past_key_values
-                    next_ids = _next_token_ids(outputs.logits[:, -1, :], cfg, generator)
+                    next_ids = _next_token_ids(
+                        outputs.logits[:, -1, :], cfg, generator,
+                        step_label=f"decode step {step}",
+                    )
 
             if writer is not None and profiler.pending_trace_rows() >= cfg.profiler.trace_flush_rows:
                 writer.write(profiler.take_trace())
