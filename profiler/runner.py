@@ -155,6 +155,7 @@ def _next_token_ids(
     cfg: RunConfig,
     generator: Any = None,
     step_label: str = "",
+    nonfinite_stats: dict[str, Any] | None = None,
 ) -> Any:
     """Choose the next token id per sequence from final-position logits.
 
@@ -163,6 +164,8 @@ def _next_token_ids(
         cfg: Run config; reads ``profiler.sample/temperature/top_p``.
         generator: Optional ``torch.Generator`` for reproducible sampling.
         step_label: Human-readable phase/step, used only in the NaN error below.
+        nonfinite_stats: Optional mutable dict (``rows``, ``values``, ``steps``)
+            to accumulate non-finite-logit occurrences into, instead of failing.
 
     Returns:
         Integer tensor ``[batch, 1]`` of chosen token ids.
@@ -171,23 +174,37 @@ def _next_token_ids(
     base model prone to repetition loops, and a repeated token routes to the
     same experts on every step -- which would make the activation trace describe
     the loop rather than the model's routing behaviour.
+
+    A NaN/inf value here comes from the model's own forward pass, not from
+    sampling. A handful of non-finite entries in an otherwise-finite row are
+    masked to -inf (so they are simply never chosen) and counted into
+    ``nonfinite_stats`` rather than aborting the run: this tensor only decides
+    which token to generate next, not anything the profiler measures, and this
+    project has observed it happen on a clean checkpoint at a rate of ~0.06% of
+    vocab entries -- consistent with a narrow forward-pass numerics artifact,
+    not corrupted weights. A row that is *entirely* non-finite has no safe
+    fallback (there is nothing left to choose from) and still raises, with the
+    step that produced it, rather than deferring to the `torch.multinomial`
+    assertion three frames later -- that error is an async CUDA device-side
+    assert whose reported stack trace can be wrong (PyTorch's own warning).
     """
     import torch
 
-    # A NaN/inf here comes from the model's own forward pass, not from sampling.
-    # Surfacing it immediately, with the step that produced it, beats the
-    # `torch.multinomial` assertion three frames later: that error is an async
-    # CUDA device-side assert whose reported stack trace can be wrong (PyTorch's
-    # own warning), so it never actually names which forward call was at fault.
     bad = torch.isnan(logits) | torch.isinf(logits)
     if bad.any():
-        raise RuntimeError(
-            f"non-finite logits at {step_label or 'this step'}: "
-            f"{int(torch.isnan(logits).sum())} NaN, "
-            f"{int(torch.isinf(logits).sum())} inf out of {logits.numel()} values. "
-            "This is a model forward-pass bug (numerics or device_map sharding), "
-            "not a sampling bug -- see profiler/runner.py::_next_token_ids."
-        )
+        row_all_bad = bad.all(dim=-1)
+        if row_all_bad.any():
+            raise RuntimeError(
+                f"entirely non-finite logits at {step_label or 'this step'} for "
+                f"{int(row_all_bad.sum())} row(s) -- no finite token to fall back "
+                "on. This is a model forward-pass bug (numerics or device_map "
+                "sharding), not a sampling bug -- see profiler/runner.py::_next_token_ids."
+            )
+        logits = logits.masked_fill(bad, float("-inf"))
+        if nonfinite_stats is not None:
+            nonfinite_stats["rows"] += int(bad.any(dim=-1).sum())
+            nonfinite_stats["values"] += int(bad.sum())
+            nonfinite_stats["steps"].add(step_label or "this step")
 
     if not cfg.profiler.sample:
         return logits.argmax(dim=-1, keepdim=True)
@@ -298,6 +315,7 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
     # Built lazily on the first decode step, once the logits' device is known
     # (device_map="auto" can put the output head on a different GPU).
     generator: Any = None
+    nonfinite_stats: dict[str, Any] = {"rows": 0, "values": 0, "steps": set()}
 
     with torch.no_grad(), profiler:
         for batch_idx, batch in enumerate(data.iter_batches(sequences, cfg.data.batch_size)):
@@ -328,7 +346,8 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                 if generator is None:
                     generator = _sampling_generator(cfg, outputs.logits.device)
                 next_ids = _next_token_ids(
-                    outputs.logits[:, -1, :], cfg, generator, step_label="prefill"
+                    outputs.logits[:, -1, :], cfg, generator,
+                    step_label="prefill", nonfinite_stats=nonfinite_stats,
                 )
                 for step in range(cfg.profiler.max_new_tokens):
                     profiler.begin_batch(
@@ -351,7 +370,7 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
                     past = outputs.past_key_values
                     next_ids = _next_token_ids(
                         outputs.logits[:, -1, :], cfg, generator,
-                        step_label=f"decode step {step}",
+                        step_label=f"decode step {step}", nonfinite_stats=nonfinite_stats,
                     )
 
             if writer is not None and profiler.pending_trace_rows() >= cfg.profiler.trace_flush_rows:
@@ -379,6 +398,27 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
             "The model's routing is not plain top-k over raw logits (e.g. grouped or "
             "bias-corrected routing). Counts still come from the router's own emitted "
             "indices where available; review extract_routing() before trusting them."
+        )
+    if nonfinite_stats["rows"]:
+        log(
+            f"      WARNING: masked {nonfinite_stats['values']:,} non-finite sampling-logit "
+            f"values across {nonfinite_stats['rows']:,} row(s) at: "
+            f"{', '.join(sorted(nonfinite_stats['steps']))}. These were forced to -inf so "
+            "generation could continue; this affects only which token gets generated next, "
+            "not the router dispatch counts below -- see nonfinite_logit_rows for whether "
+            "those were also affected."
+        )
+    if summary["nonfinite_logit_rows"]:
+        per_site = summary["nonfinite_logit_rows_per_site"]
+        bad_sites = [
+            f"layer {layer_ids[i]} ({n} rows)" for i, n in enumerate(per_site) if n
+        ]
+        log(
+            f"      WARNING: {summary['nonfinite_logit_rows']:,} token rows had "
+            f"NaN/inf router logits at: {', '.join(bad_sites)}. The recomputed top-k "
+            "indices for these rows are not meaningful -- their dispatch counts are "
+            "not trustworthy and should not be cited as evidence of real routing "
+            "behaviour. This is a forward-pass numerics bug, not a hooking bug."
         )
 
     log("[5/6] classifying hot/cold")
@@ -431,6 +471,11 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
             "forward_wall_seconds": round(forward_seconds, 3),
         },
         "profiler_summary": summary,
+        "sampling_nonfinite_logits": {
+            "rows": nonfinite_stats["rows"],
+            "values": nonfinite_stats["values"],
+            "steps": sorted(nonfinite_stats["steps"]),
+        },
         "classification": result.overall,
         "trace": {
             "path": str(writer.path.name) if writer else None,

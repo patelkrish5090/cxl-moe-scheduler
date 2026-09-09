@@ -308,6 +308,13 @@ class RouterProfiler:
         self.cross_check_mismatch = 0
         self.shape_warnings = 0
         self.orphan_dispatches = 0
+        # Per-site count of token rows whose router logits contained NaN/inf.
+        # extract_routing() will still recompute *some* top-k indices from a
+        # non-finite logits row (torch.topk doesn't raise on NaN), so counts
+        # silently keep accumulating from garbage without this -- it is the
+        # only thing that would ever reveal that a site's dispatch counts are
+        # not trustworthy for the rows this covers.
+        self.nonfinite_logit_rows = np.zeros(len(self.sites), dtype=np.int64)
 
     # ---------------------------------------------------------------- lifecycle
     def __enter__(self) -> "RouterProfiler":
@@ -382,6 +389,11 @@ class RouterProfiler:
         site = self.sites[site_idx]
         n_rows = int(indices.shape[0])
         ctx = self._ctx
+
+        if logits is not None:
+            bad_rows = ~torch.isfinite(logits).all(dim=-1)
+            if bad_rows.any():
+                self.nonfinite_logit_rows[site_idx] += int(bad_rows.sum().item())
 
         if self.cross_check and logits is not None:
             recomputed = torch.topk(logits.float(), site.top_k, dim=-1).indices
@@ -497,4 +509,6 @@ class RouterProfiler:
             "cross_check_mismatch_rate": mismatch_rate,
             "shape_warnings": self.shape_warnings,
             "orphan_dispatches": self.orphan_dispatches,
+            "nonfinite_logit_rows": int(self.nonfinite_logit_rows.sum()),
+            "nonfinite_logit_rows_per_site": self.nonfinite_logit_rows.tolist(),
         }
