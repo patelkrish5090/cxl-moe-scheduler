@@ -40,9 +40,11 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 def _tiers(link_energy: float = 2.0, link_latency: float = 500.0) -> dict[str, TierFigures]:
     return {
-        "hbm": TierFigures("hbm", latency_ns=40.0, device_energy_pj_per_bit=5.0,
+        "hbm": TierFigures("hbm", latency_ns=40.0, peak_bandwidth_gbps=20.0,
+                            device_energy_pj_per_bit=5.0,
                             link_energy_pj_per_bit=0.0, total_energy_pj_per_bit=5.0),
-        "cxl": TierFigures("cxl", latency_ns=link_latency, device_energy_pj_per_bit=30.0,
+        "cxl": TierFigures("cxl", latency_ns=link_latency, peak_bandwidth_gbps=2.0,
+                            device_energy_pj_per_bit=30.0,
                             link_energy_pj_per_bit=link_energy,
                             total_energy_pj_per_bit=30.0 + link_energy),
     }

@@ -41,7 +41,14 @@ class TierFigures:
 
     Attributes:
         tier: "hbm" or "cxl".
-        latency_ns: Unloaded read latency for one fetch on this tier.
+        latency_ns: Unloaded round-trip latency for ONE SMALL memory access on
+            this tier -- what stage 2's gem5 sweep actually characterised.
+            This is time-to-first-byte, not time to move a whole expert; see
+            CostModel.cost() for why a fetch's latency is not this number
+            alone.
+        peak_bandwidth_gbps: Read bandwidth at saturation (GB = 1e9 bytes).
+            1 GB/s = 1 byte/ns, which is what makes the bytes/bandwidth ->
+            nanoseconds conversion in CostModel.cost() unit-free.
         device_energy_pj_per_bit: DRAM device energy, from a real DRAMSim3 run.
         link_energy_pj_per_bit: Link energy; 0 for hbm (direct-attach), a cited
             constant for cxl. NaN if that constant is still unsourced.
@@ -50,6 +57,7 @@ class TierFigures:
 
     tier: str
     latency_ns: float
+    peak_bandwidth_gbps: float
     device_energy_pj_per_bit: float
     link_energy_pj_per_bit: float
     total_energy_pj_per_bit: float
@@ -59,6 +67,7 @@ class TierFigures:
         return cls(
             tier=d["tier"],
             latency_ns=float(d["unloaded_latency_ns"]) if d["unloaded_latency_ns"] is not None else math.nan,
+            peak_bandwidth_gbps=float(d["peak_bandwidth_gbps"]) if d["peak_bandwidth_gbps"] is not None else math.nan,
             device_energy_pj_per_bit=float(d["device_energy_pj_per_bit"]) if d["device_energy_pj_per_bit"] is not None else math.nan,
             link_energy_pj_per_bit=float(d["link_energy_pj_per_bit"]),
             total_energy_pj_per_bit=float(d["total_energy_pj_per_bit"]) if d["total_energy_pj_per_bit"] is not None else math.nan,
@@ -89,9 +98,13 @@ class ExpertCost:
 
     All energy fields are in picojoules (pJ) for ONE token's dispatch to ONE
     expert. ``latency_ns`` is the wall-clock time that fetch occupies the link
-    for (the compute itself is assumed to overlap with the next dispatch's
-    issue, so it is not added to latency here -- see README's "what this does
-    not model").
+    for: the tier's round-trip latency PLUS the bandwidth-limited time to
+    actually move the whole expert (weight_bytes / peak_bandwidth_gbps) --
+    for a multi-hundred-MB expert the bandwidth term dominates by several
+    orders of magnitude, so using the round-trip latency alone (as an earlier
+    version of this module did) understates fetch time by ~10^4x. The compute
+    itself is assumed to overlap with the next dispatch's issue, so it is not
+    added to latency here -- see README's "what this does not model".
     """
 
     site_idx: int
@@ -137,6 +150,10 @@ class CostModel:
         link_transfer_pj are both driven by the same real DRAMSim3/gem5 run
         via the tier model; either can be NaN if that tier's constants are
         still unsourced, and NaN propagates into total_pj by design.
+
+        latency_ns = round-trip latency + weight_bytes / peak_bandwidth_gbps.
+        1 GB/s = 1 byte/ns, so that division is already in nanoseconds with no
+        extra conversion factor -- see TierFigures.peak_bandwidth_gbps.
         """
         figures = self._tiers[tier]
         weight_bytes = self._weight_bytes[site_idx]
@@ -145,6 +162,8 @@ class CostModel:
         compute_pj = float(GPU_COMPUTE_ENERGY_PJ_PER_FLOP) * self.flops_for(site_idx)
         mem_read_pj = figures.device_energy_pj_per_bit * weight_bits
         link_transfer_pj = 0.0 if tier == "hbm" else figures.link_energy_pj_per_bit * weight_bits
+        transfer_ns = weight_bytes / figures.peak_bandwidth_gbps
+        latency_ns = figures.latency_ns + transfer_ns
 
         return ExpertCost(
             site_idx=site_idx,
@@ -152,7 +171,7 @@ class CostModel:
             compute_pj=compute_pj,
             mem_read_pj=mem_read_pj,
             link_transfer_pj=link_transfer_pj,
-            latency_ns=figures.latency_ns,
+            latency_ns=latency_ns,
         )
 
 
