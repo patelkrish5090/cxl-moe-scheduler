@@ -158,18 +158,20 @@ def build_points(
     return points
 
 
-def command_for(
-    point: SweepPoint, gem5: Path, transfer_bytes: int, third_party: Path
-) -> list[str]:
+def command_for(point: SweepPoint, gem5: Path, transfer_bytes: int) -> list[str]:
     """The exact argv for one gem5 invocation."""
-    dramsim_dir = third_party / "gem5" / "ext" / "dramsim3" / "DRAMsim3"
     argv = [
         str(gem5),
         f"--outdir={point.outdir}",
         str(TIER_CONFIG),
         "--tier", point.tier,
         "--dramsim-config", str(point.device_config),
-        "--dramsim-path", str(dramsim_dir),
+        # This is DRAMSim3's OUTPUT directory (its own warning literally says
+        # "Output directory ... not exists"), not a reference-data lookup path
+        # -- pointing it at the per-point outdir keeps each sweep point's
+        # DRAMSim3 stats isolated and where memsim.parse_stats already looks
+        # for them, instead of all points overwriting one shared location.
+        "--dramsim-path", str(point.outdir) + "/",
         "--injection-period-ps", str(point.injection_period_ps),
         "--transfer-bytes", str(transfer_bytes),
     ]
@@ -219,7 +221,7 @@ def run_sweep(
             print(f"NOTE: {note}\n")
         print(f"{len(points)} gem5 invocations:\n")
         for point in points:
-            argv = command_for(point, Path(gem5_display), transfer_bytes, third_party)
+            argv = command_for(point, Path(gem5_display), transfer_bytes)
             print("  " + " ".join(argv))
         if link_latency_ns == 0.0 and "cxl" in tiers:
             print("\nNOTE: --link-latency-ns was not given, so the cxl points above show 0,")
@@ -230,7 +232,7 @@ def run_sweep(
     gem5 = find_gem5(third_party)
     for i, point in enumerate(points, 1):
         point.outdir.mkdir(parents=True, exist_ok=True)
-        argv = command_for(point, gem5, transfer_bytes, third_party)
+        argv = command_for(point, gem5, transfer_bytes)
         print(f"\n[{i}/{len(points)}] {point.label}  "
               f"({point.device_config.name}, period {point.injection_period_ps} ps)")
         print("  " + " ".join(argv))
