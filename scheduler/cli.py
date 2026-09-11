@@ -13,7 +13,14 @@ import argparse
 import sys
 from pathlib import Path
 
-from .model import CostModel, load_expert_weight_bytes, load_hot_experts, load_tier_model, load_trace
+from .model import (
+    CostModel,
+    load_expert_dispatch_counts,
+    load_expert_weight_bytes,
+    load_hot_experts,
+    load_tier_model,
+    load_trace,
+)
 from .simulate import diff_decisions, run_energy_aware_defer, run_energy_aware_evict, run_naive, three_way_report
 
 
@@ -21,10 +28,11 @@ def _load_inputs(run_dir: Path, tier_model_path: Path):
     trace = load_trace(run_dir / "trace.parquet")
     weight_bytes = load_expert_weight_bytes(run_dir / "hot_cold.csv")
     hot = load_hot_experts(run_dir / "hot_cold.csv")
+    dispatch_counts = load_expert_dispatch_counts(run_dir / "hot_cold.csv")
     tiers = load_tier_model(tier_model_path)
     cost_model = CostModel(weight_bytes, tiers)
     cache_capacity = {site: len(experts) for site, experts in hot.items()}
-    return trace, cost_model, cache_capacity
+    return trace, cost_model, cache_capacity, dispatch_counts
 
 
 def _print_summary(label: str, summary: dict) -> None:
@@ -38,7 +46,7 @@ def _print_summary(label: str, summary: dict) -> None:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir)
-    trace, cost_model, cache_capacity = _load_inputs(run_dir, Path(args.tier_model))
+    trace, cost_model, cache_capacity, dispatch_counts = _load_inputs(run_dir, Path(args.tier_model))
 
     if args.policy == "naive":
         result = run_naive(trace, cost_model, cache_capacity)
@@ -48,7 +56,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 2
         result = run_energy_aware_defer(trace, cost_model, cache_capacity, args.power_budget_w)
     else:  # energy-aware-evict
-        result = run_energy_aware_evict(trace, cost_model, cache_capacity)
+        result = run_energy_aware_evict(trace, cost_model, cache_capacity, dispatch_counts)
 
     _print_summary(f"{args.policy} policy -- {run_dir.name}", result.summary())
     return 0
@@ -62,7 +70,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         print("--power-budget-w is required", file=sys.stderr)
         return 2
     run_dir = Path(args.run_dir)
-    trace, cost_model, cache_capacity = _load_inputs(run_dir, Path(args.tier_model))
+    trace, cost_model, cache_capacity, _dispatch_counts = _load_inputs(run_dir, Path(args.tier_model))
 
     naive = run_naive(trace, cost_model, cache_capacity)
     defer = run_energy_aware_defer(trace, cost_model, cache_capacity, args.power_budget_w)
@@ -82,11 +90,11 @@ def _cmd_compare3(args: argparse.Namespace) -> int:
         print("--power-budget-w is required", file=sys.stderr)
         return 2
     run_dir = Path(args.run_dir)
-    trace, cost_model, cache_capacity = _load_inputs(run_dir, Path(args.tier_model))
+    trace, cost_model, cache_capacity, dispatch_counts = _load_inputs(run_dir, Path(args.tier_model))
 
     naive = run_naive(trace, cost_model, cache_capacity)
     defer = run_energy_aware_defer(trace, cost_model, cache_capacity, args.power_budget_w)
-    evict = run_energy_aware_evict(trace, cost_model, cache_capacity)
+    evict = run_energy_aware_evict(trace, cost_model, cache_capacity, dispatch_counts)
 
     _print_summary("naive", naive.summary())
     _print_summary("energy-aware-defer", defer.summary())

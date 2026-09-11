@@ -154,7 +154,7 @@ class SimulationResult:
 @dataclass
 class _Entry:
     refetch_cost_pj: float
-    access_count: int
+    global_frequency: int  # stage 1's real whole-trace dispatch_count; static per entry
     last_touched: int  # this site's local dispatch-clock reading at last touch
 
 
@@ -165,29 +165,39 @@ class _SiteCache:
     profiler/analyze.py::simulate_lru's semantics.
 
     eviction_policy="energy-aware" scores each candidate by
-    (access_count * refetch_cost_pj) / age_since_last_touch and evicts the
-    minimum -- a recency-decayed frequency score (the GDSF,
-    Greedy-Dual-Size-Frequency, family of cache-replacement algorithms), not
-    plain frequency. WHY THE DECAY TERM IS LOAD-BEARING, NOT A NICETY: a first
-    version of this scored by (access_count * refetch_cost_pj) alone, with no
-    decay. On the real Mixtral decode trace that version FAILED docs.md 6
-    checkpoint 3 -- 7.1% MORE total energy than naive, and a WORSE hit rate
-    (25.8% vs naive's 31.7%). Diagnosis: an expert popular early in a 262K-
-    dispatch trace keeps a permanently high access_count and is never evicted
-    again even once the trace moves past needing it, while genuinely-current
-    experts get evicted prematurely because their count hasn't caught up yet
-    -- the classic "stale popularity" failure mode of pure LFU. The
-    hand-traced example in selftest.py didn't catch this because it has no
-    temporal drift; a 262K-dispatch real trace does. Dividing by
-    time-since-last-touch fixes it: a stale entry's score decays even with a
-    high historical count, while a genuinely-current one stays competitive.
+    (global_frequency * refetch_cost_pj) / age_since_last_touch and evicts the
+    minimum -- stage 1's real, whole-trace dispatch_count (from hot_cold.csv,
+    via model.load_expert_dispatch_counts), decayed by recency.
+
+    TWO EARLIER VERSIONS OF THIS WERE TRIED AND FAILED ON THE REAL MIXTRAL
+    DECODE TRACE -- record why, since the failures are as informative as the
+    fix:
+      v1: (access_count * refetch_cost_pj), access_count a RUNNING in-sim
+          counter, no decay. FAILED: 7.1% MORE total energy than naive, worse
+          hit rate (25.8% vs 31.7%). An expert popular early in a 262K-
+          dispatch trace kept a permanently high count and was never evicted
+          again even once the trace moved past needing it -- classic "stale
+          popularity", the textbook LFU failure mode.
+      v2: same running counter, but decayed by age_since_last_touch (the
+          GDSF, Greedy-Dual-Size-Frequency, family). Better but STILL FAILED:
+          5.7% more energy, 27.0% hit rate. The remaining problem: a running
+          counter resets to 1 every time an expert cycles OUT of the cache and
+          back IN, so it only ever reflects "how many times since its last
+          re-fetch", never the expert's TRUE whole-trace popularity -- exactly
+          the frequent-but-briefly-evicted case this policy most needs to get
+          right.
+      v3 (this version): global_frequency is stage 1's real dispatch_count,
+          loaded once from hot_cold.csv and never reset by eviction/re-fetch
+          churn. Whether this actually passes checkpoint 3 on the real trace
+          is reported in scheduler/README.md's "Checkpoint 3 result", not
+          assumed here.
 
     WHY NOT COST ALONE: within one site, every expert has the same
     weight_bytes (hot_cold.csv's expert_weight_bytes is constant per site),
     so refetch_cost_pj is IDENTICAL across every candidate in a single
     eviction decision -- weighting by cost alone would degenerate to
     (constant) * nothing, i.e. no signal, i.e. an arbitrary tie-break. The
-    terms that actually vary per expert are access frequency (what stage 1's
+    terms that actually vary per expert are dispatch frequency (what stage 1's
     gini/entropy skew measurements are about) and recency; cost is kept in
     the formula because it is the structurally correct term docs.md 4.5 asks
     for, and it WILL differentiate candidates in a model whose experts vary
@@ -207,22 +217,25 @@ class _SiteCache:
         self._clock += 1
         if expert_id in self._entries:
             entry = self._entries[expert_id]
-            entry.access_count += 1
             entry.last_touched = self._clock
             self._entries.move_to_end(expert_id)
             return True
         return False
 
-    def insert(self, expert_id: int, refetch_cost_pj: float) -> int | None:
+    def insert(self, expert_id: int, refetch_cost_pj: float, global_frequency: int = 1) -> int | None:
         """Insert a freshly-fetched expert, evicting per eviction_policy if
         now over capacity. Returns the evicted expert_id, or None.
 
         Only ever called immediately after a hit() that returned False for
         the same dispatch, so self._clock has already been advanced for this
         dispatch -- last_touched=self._clock is correct without a second tick.
+
+        global_frequency defaults to 1 (meaningful for eviction_policy="lru",
+        which ignores it entirely) -- energy-aware callers must pass the real
+        stage-1 dispatch_count explicitly; see run_energy_aware_evict.
         """
         self._entries[expert_id] = _Entry(
-            refetch_cost_pj=refetch_cost_pj, access_count=1, last_touched=self._clock
+            refetch_cost_pj=refetch_cost_pj, global_frequency=global_frequency, last_touched=self._clock
         )
         self._entries.move_to_end(expert_id)
         if len(self._entries) <= self.capacity:
@@ -234,7 +247,7 @@ class _SiteCache:
 
     def _evict_by_value(self) -> int:
         """Evict the entry with the smallest
-        (access_count * refetch_cost_pj) / (age_since_last_touch + 1).
+        (global_frequency * refetch_cost_pj) / (age_since_last_touch + 1).
 
         The +1 avoids division by zero for an entry touched on this exact
         dispatch (age 0) -- see insert()'s note on why the just-inserted entry
@@ -252,7 +265,7 @@ class _SiteCache:
         worst_key, worst_score = None, math.inf
         for key, entry in self._entries.items():
             age = self._clock - entry.last_touched + 1
-            score = (entry.access_count * entry.refetch_cost_pj) / age
+            score = (entry.global_frequency * entry.refetch_cost_pj) / age
             if math.isnan(score):
                 worst_key, worst_score = key, math.nan
                 break  # an unsourced-cost entry is the most urgent to flag, evict it first
@@ -269,6 +282,7 @@ def _run(
     policy: Policy,
     eviction_policy: EvictionPolicy,
     power_budget_w: float | None,
+    dispatch_counts: dict[int, dict[int, int]] | None = None,
 ) -> SimulationResult:
     if policy == "energy-aware-defer" and (power_budget_w is None or power_budget_w <= 0):
         raise ValueError("energy-aware-defer policy requires power_budget_w > 0")
@@ -327,7 +341,8 @@ def _run(
             energy_budget_pj -= cost.total_pj
 
         sim_time_ns += cost.latency_ns
-        cache.insert(expert_id, refetch_cost)
+        global_frequency = dispatch_counts[site_idx][expert_id] if dispatch_counts is not None else 1
+        cache.insert(expert_id, refetch_cost, global_frequency)
         result.decisions.append(Decision(
             token_uid=int(row.token_uid), site_idx=site_idx, expert_id=expert_id,
             hit=False, deferred=deferred, energy_pj=cost.total_pj, wait_ns=wait_ns,
@@ -370,12 +385,20 @@ def run_energy_aware_defer(
 
 
 def run_energy_aware_evict(
-    trace: pd.DataFrame, cost_model: CostModel, cache_capacity: dict[int, int]
+    trace: pd.DataFrame,
+    cost_model: CostModel,
+    cache_capacity: dict[int, int],
+    dispatch_counts: dict[int, dict[int, int]],
 ) -> SimulationResult:
     """Energy-aware EVICTION: fetch every cold expert immediately (no
     deferral -- isolating the eviction mechanism's effect on total energy
     from the (energy-neutral) timing effect run_energy_aware_defer has), but
-    evict by (access_count * refetch_cost_pj) instead of pure recency.
+    evict by (global_frequency * refetch_cost_pj) / age instead of pure
+    recency. global_frequency is stage 1's real, whole-trace dispatch_count
+    per (site, expert) -- see model.load_expert_dispatch_counts and
+    _SiteCache's docstring for why this, not a running in-simulation counter,
+    is the right signal (two earlier versions using a running counter were
+    tried and failed on the real trace; documented there, not repeated here).
 
     This is the policy that can actually satisfy docs.md 6 checkpoint 3
     (energy-aware total energy <= naive's): by changing which experts get
@@ -385,7 +408,10 @@ def run_energy_aware_evict(
     assume it from the architecture (see scheduler/README.md's reported
     numbers).
     """
-    return _run(trace, cost_model, cache_capacity, "energy-aware-evict", "energy-aware", power_budget_w=None)
+    return _run(
+        trace, cost_model, cache_capacity, "energy-aware-evict", "energy-aware",
+        power_budget_w=None, dispatch_counts=dispatch_counts,
+    )
 
 
 def diff_decisions(a: SimulationResult, b: SimulationResult, max_examples: int = 10) -> str:

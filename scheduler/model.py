@@ -182,6 +182,25 @@ def load_expert_weight_bytes(hot_cold_csv: str | Path) -> dict[int, int]:
     return {int(site): int(nbytes) for site, nbytes in per_site.items()}
 
 
+def load_expert_dispatch_counts(hot_cold_csv: str | Path) -> dict[int, dict[int, int]]:
+    """Real, whole-trace dispatch_count per (site_idx, expert_id) from stage
+    1's hot_cold.csv -- the true frequency signal energy-aware-evict scores
+    eviction candidates by (see scheduler/simulate.py's _SiteCache docstring
+    for why an in-simulation running counter is the wrong signal: it resets
+    every time an expert cycles out of the cache and back in, so it never
+    reflects true whole-trace popularity, only "how many times since its last
+    re-fetch"). Using stage 1's own pre-computed, already-profiled figure
+    instead is consistent with docs.md 4.2's own design -- offline profiling
+    informing runtime placement decisions is the intended workflow here, not
+    a shortcut.
+    """
+    table = pd.read_csv(hot_cold_csv)
+    out: dict[int, dict[int, int]] = {}
+    for site, group in table.groupby("site_idx"):
+        out[int(site)] = {int(e): int(c) for e, c in zip(group["expert_id"], group["dispatch_count"])}
+    return out
+
+
 def load_hot_experts(hot_cold_csv: str | Path) -> dict[int, set[int]]:
     """Stage 1's hot-expert set per site_idx -- used only to size the stage 3
     cache (see scheduler/README.md), never to hard-pin residency: stage 3's

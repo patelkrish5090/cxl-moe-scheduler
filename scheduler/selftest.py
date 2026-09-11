@@ -20,6 +20,7 @@ from .model import (
     FLOPS_PER_PARAM_PER_TOKEN,
     CostModel,
     TierFigures,
+    load_expert_dispatch_counts,
     load_expert_weight_bytes,
     load_hot_experts,
     load_tier_model,
@@ -111,32 +112,33 @@ def main() -> int:
     check("the newest entry is present", cache.hit(3))
 
     print("\n[energy-aware site cache: eviction scoring]")
-    # capacity 2, all same cost -> score is (access_count / age). A is
-    # accessed 3x then goes quiet, B is accessed once more recently; both are
-    # in cache when C arrives and forces an eviction. Recency-decayed
-    # frequency must still keep the more valuable A and drop B here despite B
-    # being touched more recently -- see _SiteCache's docstring for why this
-    # needs BOTH terms (pure frequency alone regressed on the real trace).
+    # capacity 2, all same cost -> score is (global_frequency / age). Expert 1
+    # has real (stage-1) global_frequency=10, expert 2 has global_frequency=1
+    # but was touched more recently than 1. Recency-decayed frequency must
+    # still keep the high-value expert 1 and drop the low-value expert 2 here
+    # despite 2 being more recent -- see _SiteCache's docstring for why global
+    # frequency (not a running in-sim counter -- two earlier versions using
+    # one regressed on the real trace) is the right signal.
     # insert() must only be called right after a hit() that returned False for
     # the same key (the class's usage contract -- see insert()'s docstring),
     # so every insert below is paired with a preceding hit() check.
     ecache = _SiteCache(capacity=2, eviction_policy="energy-aware")
     check("expert 1 misses on an empty cache", not ecache.hit(1))
-    ecache.insert(1, refetch_cost_pj=10.0)
-    check("expert 1 hits twice more", ecache.hit(1) and ecache.hit(1))  # access_count now 3
+    ecache.insert(1, refetch_cost_pj=10.0, global_frequency=10)
+    check("expert 1 hit again (recency bookkeeping only -- frequency is static now)", ecache.hit(1))
     check("expert 2 misses", not ecache.hit(2))
-    ecache.insert(2, refetch_cost_pj=10.0)  # access_count 1, room for both, no eviction
+    ecache.insert(2, refetch_cost_pj=10.0, global_frequency=1)  # room for both, no eviction yet
     check("expert 3 misses", not ecache.hit(3))
-    evicted = ecache.insert(3, refetch_cost_pj=10.0)  # forces an eviction
-    check("energy-aware eviction drops the low-frequency entry, not the recent one",
-          evicted == 2, f"evicted {evicted}, expected 2 (low frequency) not 1 (high frequency)")
+    evicted = ecache.insert(3, refetch_cost_pj=10.0, global_frequency=1)  # forces an eviction
+    check("energy-aware eviction drops the low-frequency entry, not the high-frequency one",
+          evicted == 2, f"evicted {evicted}, expected 2 (freq=1) not 1 (freq=10)")
     check("the high-frequency entry survives", ecache.hit(1))
 
     nan_cache = _SiteCache(capacity=1, eviction_policy="energy-aware")
     check("nan-cost expert 1 misses on an empty cache", not nan_cache.hit(1))
-    nan_cache.insert(1, refetch_cost_pj=math.nan)
+    nan_cache.insert(1, refetch_cost_pj=math.nan, global_frequency=5)
     check("expert 2 misses", not nan_cache.hit(2))
-    nan_evicted = nan_cache.insert(2, refetch_cost_pj=10.0)
+    nan_evicted = nan_cache.insert(2, refetch_cost_pj=10.0, global_frequency=1)
     check("a NaN-cost entry (unsourced constant) is evicted first, not kept forever",
           nan_evicted == 1, f"evicted {nan_evicted}")
 
@@ -224,8 +226,11 @@ def main() -> int:
         (5, 0, 33),                                       # C forces an eviction
         (6, 0, 11),                                       # A again
     ])
+    # Real (stage-1-style) whole-trace dispatch counts: A=11 appears 5 times
+    # total (positions 0,1,2,3,6), B=22 and C=33 once each.
+    ckpt3_counts = {0: {11: 5, 22: 1, 33: 1}}
     ckpt3_naive = run_naive(ckpt3_trace, cm, cache_capacity={0: 2})
-    ckpt3_evict = run_energy_aware_evict(ckpt3_trace, cm, cache_capacity={0: 2})
+    ckpt3_evict = run_energy_aware_evict(ckpt3_trace, cm, cache_capacity={0: 2}, dispatch_counts=ckpt3_counts)
 
     check("hand-traced: naive/LRU evicts the frequent expert, so the last access misses",
           not ckpt3_naive.decisions[-1].hit, "expected naive's last dispatch (A again) to miss")
@@ -271,6 +276,10 @@ def main() -> int:
         hot = load_hot_experts(root / "hot_cold.csv")
         check("hot experts loaded per site, cold expert excluded",
               hot == {0: {0, 1}}, f"got {hot}")
+
+        dispatch_counts = load_expert_dispatch_counts(root / "hot_cold.csv")
+        check("dispatch counts loaded per site per expert",
+              dispatch_counts == {0: {0: 10, 1: 5, 2: 1}}, f"got {dispatch_counts}")
 
         trace_df = _make_trace([(0, 0, 0), (0, 0, 1), (1, 0, 0)])
         trace_df.to_parquet(root / "trace.parquet")
