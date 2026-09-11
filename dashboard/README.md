@@ -15,6 +15,14 @@ Opens in a browser (Streamlit prints the local URL). Two sidebar selectors:
 - **Experiment result** — any `experiments/results/*.json` written by
   `python -m experiments.cli run`.
 - **Stage-1 run** — any `data/runs/<name>/` directory with a `hot_cold.csv`.
+  Defaults to the run that actually produced the selected experiment result
+  (matched by name — `experiments.cli run data/runs/<name>` always writes
+  `<name>.json`), so the two selectors can't silently point at different
+  runs. A checkbox ("use an independent stage-1 run") opts out of the link
+  for the rare case of wanting to look at a different run's heatmap; if the
+  matching run is missing entirely, the page falls back to the independent
+  selector automatically and says so explicitly, rather than silently
+  showing a heatmap from an unrelated run.
 
 If either is missing, the page says so explicitly and prints the exact
 command to produce it — it never fabricates a number or silently renders an
@@ -23,16 +31,34 @@ empty chart (CLAUDE.md).
 ## What it shows
 
 1. **Three-way comparison** — grouped bar charts (throughput, average
-   latency, total energy) for `hbm_only` / `hbm_cxl_naive` /
-   `hbm_cxl_energy_aware`, a figures table, and a one-line docs.md 6
-   checkpoint-3 verdict computed directly from the loaded result (not
-   hardcoded — recomputed from whichever result file is selected).
-2. **Activation heatmap** — layer x expert within-layer dispatch share for
+   latency in ms/token, total energy) for `hbm_only` / `hbm_cxl_naive` /
+   `hbm_cxl_energy_aware`, a figures table (both ns/tok and ms/tok), a
+   one-line docs.md 6 checkpoint-3 verdict computed directly from the loaded
+   result (not hardcoded — recomputed from whichever result file is
+   selected), and two sanity-check banners that fire but never hide the
+   underlying number: a per-config warning when `avg_latency_ms_per_token`
+   exceeds `experiments.harness.LATENCY_SANITY_CEILING_MS`, and a banner when
+   the checkpoint-3 energy gap is below `MARGINAL_ENERGY_GAP_PCT` (1%) and
+   could plausibly be noise.
+2. **Eviction diagnostics** — the direct evidence for whether the
+   energy-aware eviction policy actually does anything different from pure
+   LRU on this trace (`scheduler.simulate.eviction_divergence_report`):
+   total LRU eviction events, how many diverged, the divergence rate (with
+   its own near-zero warning), and up to 5 sampled diverging decisions
+   (which expert each policy evicted, its real stage-1 dispatch frequency,
+   and how many more times it was requested later in the trace).
+3. **Activation heatmap** — layer x expert within-layer dispatch share for
    the selected stage-1 run. Same data and pivot as
    `profiler/plots.py::plot_activation_heatmap`'s static PNG
    (`hot_cold.csv`'s `layer_idx`/`expert_id`/`layer_share` columns), rendered
    as an interactive Plotly heatmap instead — hover a cell to read its exact
    share, rather than reading a fixed color scale off a saved image.
+4. **Activation skew summary** — the heatmap alone reads as fairly flat by
+   eye at Mixtral's scale (32 experts x many layers), so this adds a number:
+   overall Gini coefficient and max/mean dispatch ratio
+   (`dashboard.data.build_expert_skew_summary`, reusing
+   `profiler.classify.gini`), plus the top-5 and bottom-5 experts by total
+   dispatch share summed across all layers.
 
 ## Architecture
 
@@ -58,8 +84,12 @@ raises `FileNotFoundError` naming the producing command (not a silent
 default) and `KeyError` on a malformed/incomplete result file rather than
 quietly dropping a row, that `list_stage1_runs` correctly excludes a run
 directory with no `hot_cold.csv` (an empty placeholder, not a real
-completed run), and that `build_heatmap_grid`'s pivot matches its source
-values exactly.
+completed run), that `build_heatmap_grid`'s pivot matches its source values
+exactly, that `load_comparison_payload` carries the `checkpoint3` and
+`eviction_divergence` sections through untouched, and that
+`build_expert_skew_summary`'s per-expert totals, Gini, and max/mean ratio
+match an independent recompute (including the degenerate perfectly-uniform
+case, where Gini must be exactly 0 and the ratio exactly 1.0).
 
 The app itself (`dashboard/app.py`) was verified headlessly with
 Streamlit's own `streamlit.testing.v1.AppTest` during development, both

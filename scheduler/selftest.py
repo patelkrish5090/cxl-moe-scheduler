@@ -29,6 +29,7 @@ from .model import (
 from .simulate import (
     _SiteCache,
     diff_decisions,
+    eviction_divergence_report,
     run_energy_aware_defer,
     run_energy_aware_evict,
     run_hbm_only,
@@ -265,6 +266,52 @@ def main() -> int:
     report_text = three_way_report(ckpt3_naive, ckpt3_defer, ckpt3_evict)
     check("three_way_report declares checkpoint 3 PASSED on the hand-traced example",
           "PASSED" in report_text, report_text)
+
+    print("\n[eviction divergence report]")
+    # Same hand-traced sequence as checkpoint 3 above, capacity 2. Two LRU
+    # eviction events actually occur:
+    #   step 5 (C arrives, A and B both resident): LRU evicts A (last touched
+    #     step 3, older than B's step 4) -- the wrong call, since A is the
+    #     frequent expert. Energy-aware-evict keeps A and evicts B instead.
+    #     DIVERGES (11 vs 22).
+    #   step 6 (A requested again): naive's cache is now {B, C} (having
+    #     evicted A at step 5), so this is a second miss/eviction -- naive
+    #     evicts B (older than C). Energy-aware-evict already has A cached
+    #     (it kept A at step 5), so step 6 is a HIT for it -- not an eviction
+    #     at all, so this event does NOT count as divergent (no choice was
+    #     made to compare against).
+    div_report = eviction_divergence_report(ckpt3_naive, ckpt3_evict, ckpt3_trace, ckpt3_counts)
+    check("hand-traced: two LRU eviction events on this trace (steps 5 and 6)",
+          div_report.total_eviction_events == 2, f"got {div_report.total_eviction_events}")
+    check("hand-traced: exactly one of the two diverged (step 5; step 6 was a hit for energy-aware)",
+          div_report.divergent_eviction_events == 1, f"got {div_report.divergent_eviction_events}")
+    check("hand-traced: divergence_rate is 0.5 (1 of 2 eviction events diverged)",
+          div_report.divergence_rate == 0.5, f"got {div_report.divergence_rate}")
+    check("hand-traced: LRU evicted the frequent expert (11)",
+          div_report.examples[0].lru_evicted_expert == 11, f"got {div_report.examples[0].lru_evicted_expert}")
+    check("hand-traced: energy-aware evicted the cold expert (22) instead",
+          div_report.examples[0].energy_aware_evicted_expert == 22,
+          f"got {div_report.examples[0].energy_aware_evicted_expert}")
+    check("hand-traced: LRU's evicted expert had one more future request (step 6)",
+          div_report.examples[0].lru_evicted_future_requests == 1,
+          f"got {div_report.examples[0].lru_evicted_future_requests}")
+    check("hand-traced: energy-aware's evicted expert (B) had no future requests",
+          div_report.examples[0].energy_aware_evicted_future_requests == 0,
+          f"got {div_report.examples[0].energy_aware_evicted_future_requests}")
+    check("summary() warns when divergence rate is near-zero",
+          "WARNING" in eviction_divergence_report(
+              run_naive(trace, cm, cache_capacity={0: 1}),
+              run_naive(trace, cm, cache_capacity={0: 1}),  # identical policy: never diverges
+              trace, {0: {1: 1, 2: 1}},
+          ).summary())
+
+    mismatched_trace_result = run_naive(_make_trace([(0, 0, 1)]), cm, cache_capacity={0: 1})
+    raised_on_mismatch = False
+    try:
+        eviction_divergence_report(ckpt3_naive, mismatched_trace_result, ckpt3_trace, ckpt3_counts)
+    except ValueError:
+        raised_on_mismatch = True
+    check("eviction_divergence_report refuses to compare runs of different length", raised_on_mismatch)
 
     print("\n[decision diff]")
     diff_text = diff_decisions(result, result_poor)

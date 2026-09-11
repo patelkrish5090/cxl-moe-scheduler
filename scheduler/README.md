@@ -188,6 +188,24 @@ skew for eviction policy to matter (a flatter, more uniform trace would
 genuinely produce this), which is itself useful information about when this
 scheduling approach helps and when it doesn't.
 
+### Eviction divergence: is the 0.23% gap a real mechanism or noise?
+
+0.23% is small enough that it's worth asking directly whether the eviction
+mechanism is actually doing anything, independent of the energy percentage.
+`eviction_divergence_report` (`scheduler/simulate.py`) answers this: for
+every point where LRU had to evict something, did energy-aware-evict
+actually choose a *different* expert to evict? `python -m scheduler.cli
+compare3` prints this report's `summary()` after the checkpoint-3 verdict —
+total LRU eviction events, how many diverged, the divergence rate, and up to
+5 sampled diverging decisions with each evicted expert's real stage-1
+dispatch frequency and how many more times it was requested later in the
+trace. A divergence rate under 1% triggers its own explicit warning ("barely
+doing anything different from LRU"), the same spirit as the checkpoint-3
+report's own FAILED case above — this project reports the caveat rather than
+a clean-looking number it can't back up.
+`experiments/harness.py`'s `ComparisonResult.eviction_divergence` carries the
+same report through to the stage-4 dashboard's diagnostics panel.
+
 ## Units
 
 Energy is picojoules (`_pj`) throughout, matching memsim/constants.py, until

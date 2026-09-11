@@ -15,10 +15,12 @@ import pandas as pd
 
 from .data import (
     CONFIG_ORDER,
+    build_expert_skew_summary,
     build_heatmap_grid,
     list_comparison_results,
     list_stage1_runs,
     load_comparison,
+    load_comparison_payload,
 )
 
 failures: list[str] = []
@@ -50,16 +52,29 @@ def main() -> int:
             "configs": {
                 "hbm_only": {
                     "throughput_tokens_per_sec": 100.0, "avg_latency_ns_per_token": 10.0,
+                    "avg_latency_ms_per_token": 10.0 * 1e-6,
                     "total_energy_mj": 1.0, "hit_rate": 1.0, "n_tokens": 50, "n_dispatches": 400,
+                    "latency_plausible": True, "latency_warning": None,
                 },
                 "hbm_cxl_naive": {
                     "throughput_tokens_per_sec": 10.0, "avg_latency_ns_per_token": 100.0,
+                    "avg_latency_ms_per_token": 100.0 * 1e-6,
                     "total_energy_mj": 5.0, "hit_rate": 0.3, "n_tokens": 50, "n_dispatches": 400,
+                    "latency_plausible": True, "latency_warning": None,
                 },
                 "hbm_cxl_energy_aware": {
                     "throughput_tokens_per_sec": 12.0, "avg_latency_ns_per_token": 83.0,
+                    "avg_latency_ms_per_token": 83.0 * 1e-6,
                     "total_energy_mj": 4.5, "hit_rate": 0.35, "n_tokens": 50, "n_dispatches": 400,
+                    "latency_plausible": True, "latency_warning": None,
                 },
+            },
+            "checkpoint3": {
+                "energy_gap_pct": 10.0, "energy_gap_is_marginal": False, "marginal_threshold_pct": 1.0,
+            },
+            "eviction_divergence": {
+                "total_eviction_events": 20, "divergent_eviction_events": 15,
+                "divergence_rate": 0.75, "examples": [],
             },
         }
         result_path = results_dir / "test_run.json"
@@ -96,6 +111,27 @@ def main() -> int:
         check("a comparison file missing a config raises, not silently drops a row",
               raised_key_error)
 
+        print("\n[load_comparison_payload]")
+        raw = load_comparison_payload(result_path)
+        check("load_comparison_payload returns the raw dict, run_name intact",
+              raw["run_name"] == "test_run")
+        check("load_comparison_payload carries checkpoint3 section through untouched",
+              raw["checkpoint3"]["energy_gap_pct"] == 10.0)
+        check("load_comparison_payload carries eviction_divergence section through untouched",
+              raw["eviction_divergence"]["divergence_rate"] == 0.75)
+        raised_payload_missing = False
+        try:
+            load_comparison_payload(missing)
+        except FileNotFoundError as exc:
+            raised_payload_missing = "experiments.cli run" in str(exc)
+        check("load_comparison_payload raises on a missing file, naming the producing command",
+              raised_payload_missing)
+
+        check("load_comparison surfaces the ms-latency and plausibility columns",
+              list(df["avg_latency_ms_per_token"]) == [10.0 * 1e-6, 100.0 * 1e-6, 83.0 * 1e-6]
+              and list(df["latency_plausible"]) == [True, True, True],
+              f"got {df[['avg_latency_ms_per_token', 'latency_plausible']]}")
+
         print("\n[list_stage1_runs]")
         data_runs_dir = root / "data_runs"
         (data_runs_dir / "empty_placeholder").mkdir(parents=True)  # no hot_cold.csv -- must be excluded
@@ -130,6 +166,52 @@ def main() -> int:
             raised_missing = True
         check("a missing hot_cold.csv raises FileNotFoundError, not a confusing pandas error",
               raised_missing)
+
+        print("\n[build_expert_skew_summary]")
+        # Deliberately skewed: expert 0 gets 90 dispatches (across 2 layers),
+        # experts 1-3 get 10 combined -- summed across layers per expert.
+        skew_hot_cold = pd.DataFrame({
+            "layer_idx":       [0, 0, 0, 0, 1, 1, 1, 1],
+            "expert_id":       [0, 1, 2, 3, 0, 1, 2, 3],
+            "dispatch_count":  [50, 2, 2, 1, 40, 2, 2, 1],
+        })
+        skew_path = root / "hot_cold_skew.csv"
+        skew_hot_cold.to_csv(skew_path, index=False)
+        skew = build_expert_skew_summary(skew_path)
+        total = 50 + 2 + 2 + 1 + 40 + 2 + 2 + 1
+        check("skew summary's per-expert totals sum across layers (expert 0 = 50+40)",
+              skew["top"][0]["expert_id"] == 0 and skew["top"][0]["dispatch_count"] == 90,
+              f"got {skew['top'][0]}")
+        check("skew summary's top-share is an independent recompute (90 / grand total)",
+              abs(skew["top"][0]["share"] - 90 / total) < 1e-9, f"got {skew['top'][0]['share']}")
+        check("gini is in [0, 1] for a genuinely skewed distribution, and clearly non-uniform",
+              0.0 < skew["gini"] <= 1.0, f"got {skew['gini']}")
+        check("max_mean_ratio is an independent recompute (max count / mean count)",
+              abs(skew["max_mean_ratio"] - 90 / ((90 + 4 + 4 + 2) / 4)) < 1e-9,
+              f"got {skew['max_mean_ratio']}")
+        check("top and bottom both come back non-empty for a 4-expert file",
+              len(skew["top"]) > 0 and len(skew["bottom"]) > 0)
+
+        print("\n[build_expert_skew_summary: uniform distribution]")
+        uniform_hot_cold = pd.DataFrame({
+            "layer_idx": [0, 0], "expert_id": [0, 1], "dispatch_count": [10, 10],
+        })
+        uniform_path = root / "hot_cold_uniform.csv"
+        uniform_hot_cold.to_csv(uniform_path, index=False)
+        uniform_skew = build_expert_skew_summary(uniform_path)
+        check("a perfectly uniform distribution has Gini == 0",
+              uniform_skew["gini"] == 0.0, f"got {uniform_skew['gini']}")
+        check("a perfectly uniform distribution has max/mean ratio == 1.0",
+              uniform_skew["max_mean_ratio"] == 1.0, f"got {uniform_skew['max_mean_ratio']}")
+
+        missing_skew_csv = root / "no_such_hot_cold_skew.csv"
+        raised_skew_missing = False
+        try:
+            build_expert_skew_summary(missing_skew_csv)
+        except FileNotFoundError:
+            raised_skew_missing = True
+        check("build_expert_skew_summary raises FileNotFoundError on a missing file",
+              raised_skew_missing)
 
     print("\n" + "=" * 62)
     if failures:

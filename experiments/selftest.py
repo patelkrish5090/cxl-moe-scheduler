@@ -17,7 +17,7 @@ import pandas as pd
 
 from scheduler.simulate import Decision, SimulationResult
 
-from .harness import ComparisonResult, ConfigResult, run_comparison
+from .harness import LATENCY_SANITY_CEILING_MS, ComparisonResult, ConfigResult, run_comparison
 
 failures: list[str] = []
 
@@ -65,6 +65,23 @@ def main() -> int:
           cfg.total_energy_pj == 100.0, f"got {cfg.total_energy_pj}")
     check("total_energy_mj = total_energy_pj * 1e-9 (pJ -> mJ)",
           math.isclose(cfg.total_energy_mj, 100.0 * 1e-9), f"got {cfg.total_energy_mj}")
+    check("avg_latency_ms_per_token = avg_latency_ns_per_token * 1e-6 (ns -> ms)",
+          math.isclose(cfg.avg_latency_ms_per_token, 250.0 * 1e-6), f"got {cfg.avg_latency_ms_per_token}")
+    check("a small, plausible latency is not flagged", cfg.latency_plausible and cfg.latency_warning is None)
+
+    print("\n[ConfigResult: latency sanity ceiling]")
+    # One dispatch with a latency well past LATENCY_SANITY_CEILING_MS.
+    slow_sim = _fake_result(latencies_ns=[LATENCY_SANITY_CEILING_MS * 1e6 * 10], energies_pj=[1.0])
+    slow_cfg = ConfigResult.from_simulation("slow", slow_sim, n_tokens=1)
+    check("a latency far past the sanity ceiling is flagged implausible",
+          not slow_cfg.latency_plausible, f"avg_ms={slow_cfg.avg_latency_ms_per_token}")
+    check("an implausible latency carries a non-None warning naming the ceiling",
+          slow_cfg.latency_warning is not None and "sanity ceiling" in slow_cfg.latency_warning)
+    check("a latency exactly at the ceiling is still plausible (boundary is exclusive)",
+          ConfigResult.from_simulation(
+              "boundary", _fake_result(latencies_ns=[LATENCY_SANITY_CEILING_MS * 1e6], energies_pj=[1.0]),
+              n_tokens=1,
+          ).latency_plausible)
 
     print("\n[ConfigResult: degenerate cases]")
     empty = SimulationResult(policy="naive")
@@ -131,6 +148,28 @@ def main() -> int:
               comparison.hbm_only.n_tokens == comparison.hbm_cxl_naive.n_tokens ==
               comparison.hbm_cxl_energy_aware.n_tokens == 20)
 
+        print("\n[ComparisonResult: checkpoint-3 gap and eviction divergence wiring]")
+        expected_gap = 100.0 * (
+            comparison.hbm_cxl_naive.total_energy_pj - comparison.hbm_cxl_energy_aware.total_energy_pj
+        ) / comparison.hbm_cxl_naive.total_energy_pj
+        check("energy_gap_pct matches an independent recompute from the two configs' own energies",
+              math.isclose(comparison.energy_gap_pct, expected_gap),
+              f"got {comparison.energy_gap_pct}, expected {expected_gap}")
+        check("energy_gap_is_marginal agrees with the gap vs the class threshold",
+              comparison.energy_gap_is_marginal == (abs(comparison.energy_gap_pct) < ComparisonResult.MARGINAL_ENERGY_GAP_PCT))
+        check("run_comparison populates eviction_divergence (not left as a missing/None field)",
+              comparison.eviction_divergence is not None)
+        check("eviction_divergence's total_eviction_events is non-negative",
+              comparison.eviction_divergence.total_eviction_events >= 0)
+        check("eviction_divergence's divergent count never exceeds its total",
+              comparison.eviction_divergence.divergent_eviction_events <= comparison.eviction_divergence.total_eviction_events)
+        check("eviction_divergence's divergence_rate matches an independent recompute",
+              math.isclose(
+                  comparison.eviction_divergence.divergence_rate,
+                  (comparison.eviction_divergence.divergent_eviction_events / comparison.eviction_divergence.total_eviction_events)
+                  if comparison.eviction_divergence.total_eviction_events else 0.0,
+              ))
+
         print("\n[JSON round-trip]")
         out_path = comparison.write(root / "result.json")
         check("result file was written", out_path.is_file())
@@ -140,6 +179,11 @@ def main() -> int:
               loaded["configs"]["hbm_only"]["hit_rate"] == comparison.hbm_only.hit_rate)
         check("all three config keys present in the written file",
               set(loaded["configs"]) == {"hbm_only", "hbm_cxl_naive", "hbm_cxl_energy_aware"})
+        check("checkpoint3 section round-trips",
+              math.isclose(loaded["checkpoint3"]["energy_gap_pct"], comparison.energy_gap_pct))
+        check("eviction_divergence section round-trips, including examples",
+              loaded["eviction_divergence"]["total_eviction_events"] == comparison.eviction_divergence.total_eviction_events
+              and len(loaded["eviction_divergence"]["examples"]) == len(comparison.eviction_divergence.examples))
 
     print("\n" + "=" * 62)
     if failures:

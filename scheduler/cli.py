@@ -21,7 +21,14 @@ from .model import (
     load_tier_model,
     load_trace,
 )
-from .simulate import diff_decisions, run_energy_aware_defer, run_energy_aware_evict, run_naive, three_way_report
+from .simulate import (
+    diff_decisions,
+    eviction_divergence_report,
+    run_energy_aware_defer,
+    run_energy_aware_evict,
+    run_naive,
+    three_way_report,
+)
 
 
 def _load_inputs(run_dir: Path, tier_model_path: Path):
@@ -103,6 +110,8 @@ def _cmd_compare3(args: argparse.Namespace) -> int:
     print(three_way_report(naive, defer, evict))
     print()
     print(diff_decisions(naive, evict))
+    print()
+    print(eviction_divergence_report(naive, evict, trace, dispatch_counts).summary())
     return 0
 
 

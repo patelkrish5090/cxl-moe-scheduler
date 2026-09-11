@@ -71,6 +71,12 @@ class Decision:
     energy_pj: float
     wait_ns: float
     sim_time_ns: float  # clock reading when this dispatch finished
+    # The expert this dispatch's fetch evicted from site_idx's cache, if any.
+    # None for a hit, or for a miss that didn't need to evict (cache had
+    # room). Lets eviction_divergence_report compare, dispatch-for-dispatch,
+    # what two policies actually evicted -- not just whether they hit or
+    # missed (diff_decisions already covers that).
+    evicted_expert_id: int | None = None
 
 
 @dataclass
@@ -342,11 +348,11 @@ def _run(
 
         sim_time_ns += cost.latency_ns
         global_frequency = dispatch_counts[site_idx][expert_id] if dispatch_counts is not None else 1
-        cache.insert(expert_id, refetch_cost, global_frequency)
+        evicted_expert_id = cache.insert(expert_id, refetch_cost, global_frequency)
         result.decisions.append(Decision(
             token_uid=int(row.token_uid), site_idx=site_idx, expert_id=expert_id,
             hit=False, deferred=deferred, energy_pj=cost.total_pj, wait_ns=wait_ns,
-            sim_time_ns=sim_time_ns,
+            sim_time_ns=sim_time_ns, evicted_expert_id=evicted_expert_id,
         ))
 
         if policy == "energy-aware-defer":
@@ -510,3 +516,141 @@ def three_way_report(naive: SimulationResult, defer: SimulationResult, evict: Si
                           "see scheduler/README.md's eviction-policy section before trusting "
                           "this scheduler's energy claims.")
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class EvictionDivergenceExample:
+    """One dispatch where naive (LRU) and energy-aware-evict both had to
+    evict something, and chose a different expert.
+    """
+
+    token_uid: int
+    site_idx: int
+    dispatch_index: int
+    lru_evicted_expert: int
+    energy_aware_evicted_expert: int
+    lru_evicted_global_frequency: int
+    energy_aware_evicted_global_frequency: int
+    lru_evicted_future_requests: int  # how many more times this expert is requested at this site, later in the trace
+    energy_aware_evicted_future_requests: int
+
+
+@dataclass(frozen=True)
+class EvictionDivergenceReport:
+    """Whether the energy-aware policy's eviction CHOICE actually differs
+    from LRU's, and how often -- the direct evidence for whether the
+    mechanism is doing anything, independent of whatever the total-energy
+    delta happens to be on one particular trace.
+
+    total_eviction_events is naive's own eviction count -- the denominator
+    is "every point where LRU had to evict something", not the union of both
+    policies' eviction counts, matching "how often does the energy-aware
+    policy's eviction choice differ from what pure-LRU would have chosen"
+    literally: the question is scoped to LRU's decision points.
+    """
+
+    total_eviction_events: int
+    divergent_eviction_events: int
+    examples: tuple[EvictionDivergenceExample, ...]
+
+    @property
+    def divergence_rate(self) -> float:
+        return self.divergent_eviction_events / self.total_eviction_events if self.total_eviction_events else 0.0
+
+    def summary(self) -> str:
+        lines = ["EVICTION DIVERGENCE -- energy-aware-evict vs pure LRU", "=" * 60]
+        lines.append(
+            f"{self.divergent_eviction_events} / {self.total_eviction_events} "
+            f"eviction events diverged ({self.divergence_rate:.2%})"
+        )
+        if self.total_eviction_events > 0 and self.divergence_rate < 0.01:
+            lines.append(
+                "  WARNING: eviction choice diverged on fewer than 1% of eviction events. "
+                "The energy-aware policy is barely doing anything different from LRU on this "
+                "trace -- any total-energy improvement is more likely noise than a real "
+                "mechanism effect. Do not report a total-energy win without checking this rate."
+            )
+        for ex in self.examples:
+            lines.append(
+                f"  token {ex.token_uid} site {ex.site_idx}: LRU evicted expert "
+                f"{ex.lru_evicted_expert} (global freq {ex.lru_evicted_global_frequency}, "
+                f"{ex.lru_evicted_future_requests} more requests later in this site's trace) "
+                f"vs energy-aware evicted expert {ex.energy_aware_evicted_expert} "
+                f"(global freq {ex.energy_aware_evicted_global_frequency}, "
+                f"{ex.energy_aware_evicted_future_requests} more requests later)"
+            )
+        return "\n".join(lines)
+
+
+def _future_requests(trace: pd.DataFrame, after_index: int, site_idx: int, expert_id: int) -> int:
+    """How many more times (site_idx, expert_id) is dispatched after row
+    after_index in the trace. A pure property of the trace, not of either
+    policy -- the same regardless of which run's decision triggered the
+    lookup.
+    """
+    remainder = trace.iloc[after_index + 1:]
+    return int(((remainder["site_idx"] == site_idx) & (remainder["expert_id"] == expert_id)).sum())
+
+
+def eviction_divergence_report(
+    naive: SimulationResult,
+    evict: SimulationResult,
+    trace: pd.DataFrame,
+    dispatch_counts: dict[int, dict[int, int]],
+    max_examples: int = 5,
+) -> EvictionDivergenceReport:
+    """Compare, dispatch-for-dispatch, what naive (LRU) and energy-aware-evict
+    actually evicted -- not just their hit/miss outcomes (diff_decisions
+    already covers that). This is the direct evidence for whether the
+    eviction mechanism is doing anything on a given trace, independent of
+    whatever the total-energy delta happens to be.
+
+    Args:
+        naive: a run_naive() result over `trace`.
+        evict: a run_energy_aware_evict() result over the SAME `trace`.
+        trace: the identical trace both were run over (for the
+            future-requests lookup; must match what produced naive/evict).
+        dispatch_counts: stage 1's real per-(site, expert) dispatch counts,
+            same as passed to run_energy_aware_evict -- used to show each
+            diverging example's global frequency for context.
+        max_examples: how many diverging examples to sample and detail.
+
+    Raises:
+        ValueError: if naive and evict have different lengths (not the same
+            trace) -- the same guard diff_decisions uses.
+    """
+    if len(naive.decisions) != len(evict.decisions):
+        raise ValueError(
+            f"naive has {len(naive.decisions)} decisions, evict has {len(evict.decisions)} "
+            "-- not the same trace"
+        )
+
+    total = 0
+    divergent = 0
+    examples: list[EvictionDivergenceExample] = []
+    for i, (n, e) in enumerate(zip(naive.decisions, evict.decisions)):
+        if n.evicted_expert_id is None:
+            continue  # LRU didn't evict here; not an eviction event
+        total += 1
+        if e.evicted_expert_id is None or e.evicted_expert_id == n.evicted_expert_id:
+            continue  # energy-aware had a hit here, or made the same choice -- not divergent
+
+        divergent += 1
+        if len(examples) < max_examples:
+            site = n.site_idx
+            lru_evicted, ea_evicted = n.evicted_expert_id, e.evicted_expert_id
+            examples.append(EvictionDivergenceExample(
+                token_uid=n.token_uid,
+                site_idx=site,
+                dispatch_index=i,
+                lru_evicted_expert=lru_evicted,
+                energy_aware_evicted_expert=ea_evicted,
+                lru_evicted_global_frequency=dispatch_counts.get(site, {}).get(lru_evicted, 0),
+                energy_aware_evicted_global_frequency=dispatch_counts.get(site, {}).get(ea_evicted, 0),
+                lru_evicted_future_requests=_future_requests(trace, i, site, lru_evicted),
+                energy_aware_evicted_future_requests=_future_requests(trace, i, site, ea_evicted),
+            ))
+
+    return EvictionDivergenceReport(
+        total_eviction_events=total, divergent_eviction_events=divergent, examples=tuple(examples),
+    )

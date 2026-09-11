@@ -23,10 +23,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     print(f"\nTHREE-WAY EXPERIMENT -- {comparison.run_name}")
     print("=" * 78)
-    print(f"{'config':<24}{'throughput_tok/s':>18}{'avg_lat_ns/tok':>18}{'energy_mJ':>16}")
+    print(f"{'config':<24}{'throughput_tok/s':>18}{'avg_lat_ms/tok':>18}{'energy_mJ':>16}")
     for cfg in (comparison.hbm_only, comparison.hbm_cxl_naive, comparison.hbm_cxl_energy_aware):
         print(f"{cfg.config:<24}{cfg.throughput_tokens_per_sec:>18.6g}"
-              f"{cfg.avg_latency_ns_per_token:>18.6g}{cfg.total_energy_mj:>16.6g}")
+              f"{cfg.avg_latency_ms_per_token:>18.6g}{cfg.total_energy_mj:>16.6g}")
+        if not cfg.latency_plausible:
+            print(f"  WARNING: {cfg.latency_warning}")
+
+    gap = comparison.energy_gap_pct
+    verdict = "lower" if gap > 0 else "HIGHER"
+    print(f"\ndocs.md 6 checkpoint 3: energy-aware total energy is {verdict} than naive's "
+          f"by {abs(gap):.2f}%")
+    if comparison.energy_gap_is_marginal:
+        print(f"  WARNING: gap is below the {comparison.MARGINAL_ENERGY_GAP_PCT:.1f}% marginal "
+              "threshold -- could be noise. Check the eviction divergence rate below before "
+              "reporting this as a validated win.")
+
+    print()
+    print(comparison.eviction_divergence.summary())
 
     written = comparison.write(out_path)
     print(f"\nwrote {written}")
