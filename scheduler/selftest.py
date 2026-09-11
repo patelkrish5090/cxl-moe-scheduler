@@ -31,6 +31,7 @@ from .simulate import (
     diff_decisions,
     run_energy_aware_defer,
     run_energy_aware_evict,
+    run_hbm_only,
     run_naive,
     three_way_report,
 )
@@ -171,6 +172,22 @@ def main() -> int:
     check("a hit costs the hbm total, not the cxl total",
           math.isclose(result_hit.decisions[1].energy_pj, hbm_cost.total_pj))
     check("hit_rate reflects exactly 1 of 2 dispatches", result_hit.hit_rate == 0.5)
+
+    print("\n[hbm-only policy]")
+    # Same trace as the "cache hit actually happens" case, but hbm-only never
+    # goes cold even on the FIRST occurrence of an expert -- unlike run_naive
+    # with a full-size cache, which still pays that first miss (see
+    # run_hbm_only's docstring for the real bug this distinction caught).
+    hbm_only_result = run_hbm_only(trace_hit, cm)
+    check("hbm-only: every dispatch is a hit, including the first",
+          all(d.hit for d in hbm_only_result.decisions),
+          f"got hits={[d.hit for d in hbm_only_result.decisions]}")
+    check("hbm-only: hit_rate is exactly 1.0", hbm_only_result.hit_rate == 1.0)
+    check("hbm-only: every dispatch costs the hbm total, not the cxl total",
+          all(math.isclose(d.energy_pj, hbm_cost.total_pj) for d in hbm_only_result.decisions))
+    check("hbm-only: strictly cheaper than naive on the same trace (never pays cxl link/device energy)",
+          hbm_only_result.total_energy_pj < result_hit.total_energy_pj,
+          f"hbm_only={hbm_only_result.total_energy_pj}, naive={result_hit.total_energy_pj}")
 
     print("\n[energy-aware-defer policy]")
     # Budget large enough to never defer: should match naive exactly, dispatch

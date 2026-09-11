@@ -51,7 +51,7 @@ import pandas as pd
 
 from .model import CostModel
 
-Policy = Literal["naive", "energy-aware-defer", "energy-aware-evict"]
+Policy = Literal["hbm-only", "naive", "energy-aware-defer", "energy-aware-evict"]
 EvictionPolicy = Literal["lru", "energy-aware"]
 
 #: W (watts) * ns -> pJ. 1 W = 1 J/s; over dt nanoseconds that is
@@ -354,6 +354,34 @@ def _run(
             # not just while waiting -- credit the fetch's own latency span.
             energy_budget_pj += cost.latency_ns * power_budget_w * _WATT_NS_TO_PJ
 
+    return result
+
+
+def run_hbm_only(trace: pd.DataFrame, cost_model: CostModel) -> SimulationResult:
+    """Every dispatch is served from HBM. No cache, no CXL, no misses -- ever.
+
+    This is memsim/README.md's own definition of the hbm tier: "everything
+    resident in GPU HBM ... the motivating case" this whole project exists as
+    an alternative to. It is NOT the same as calling run_naive() with a cache
+    capacity equal to every expert at every site -- that still starts the
+    cache empty and pays a genuine cold miss the first time each expert is
+    seen (a real bug caught in experiments/selftest.py: on a 40-dispatch, 8
+    unique-expert synthetic trace it produced exactly 32/40 = 0.8 hit rate,
+    not 1.0, from those 8 unavoidable warm-up misses). A real HBM-only
+    deployment pre-loads the entire model into HBM before serving starts --
+    there is no warm-up phase, no dispatch is ever cold, by construction.
+    Modelled here by skipping the cache/eviction machinery entirely rather
+    than trying to "pre-warm" a _SiteCache to the same effect.
+    """
+    result = SimulationResult(policy="hbm-only")
+    sim_time_ns = 0.0
+    for row in trace.itertuples(index=False):
+        cost = cost_model.cost(int(row.site_idx), int(row.expert_id), "hbm")
+        sim_time_ns += cost.latency_ns
+        result.decisions.append(Decision(
+            token_uid=int(row.token_uid), site_idx=int(row.site_idx), expert_id=int(row.expert_id),
+            hit=True, deferred=False, energy_pj=cost.total_pj, wait_ns=0.0, sim_time_ns=sim_time_ns,
+        ))
     return result
 
 
