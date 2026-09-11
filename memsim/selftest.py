@@ -76,27 +76,45 @@ def write_run(
 def main() -> int:
     print("\n[constants: placeholders must poison, not default to zero]")
     check("PLACEHOLDER is NaN", math.isnan(constants.PLACEHOLDER))
+
+    # These checks validate the placeholder/poisoning MECHANISM, not any
+    # particular project constant's current sourcing status -- use a
+    # synthetic fixture so they stay meaningful once every real constant in
+    # memsim/constants.py has actually been sourced (CXL_LINK_LATENCY_NS and
+    # CXL_LINK_ENERGY_PJ_PER_BIT, formerly used as the "known unsourced"
+    # fixtures here, are both cited now).
+    fake_placeholder = constants.Constant(
+        name="FAKE_TEST_CONSTANT", value=constants.PLACEHOLDER, unit="ns",
+        source="fixture for selftest, not a real project constant",
+        status="placeholder",
+    )
     check("an unsourced constant reports is_sourced False",
-          not constants.CXL_LINK_ENERGY_PJ_PER_BIT.is_sourced)
-    check("unsourced() lists the CXL link constants",
-          {c.name for c in constants.unsourced()}
-          >= {"CXL_LINK_LATENCY_NS", "CXL_LINK_ENERGY_PJ_PER_BIT"},
-          f"got {[c.name for c in constants.unsourced()]}")
-    check("simulated constants are not counted as unsourced",
-          "HBM_DEVICE_ENERGY" not in {c.name for c in constants.unsourced()})
+          not fake_placeholder.is_sourced)
 
-    raised = False
+    real_all_constants = constants.ALL_CONSTANTS
+    constants.ALL_CONSTANTS = real_all_constants + (fake_placeholder,)
     try:
-        constants.require_sourced("a test result")
-    except RuntimeError as exc:
-        raised = "CXL_LINK_ENERGY_PJ_PER_BIT" in str(exc)
-    check("require_sourced raises and names the missing constant", raised)
+        check("unsourced() lists an unsourced constant",
+              "FAKE_TEST_CONSTANT" in {c.name for c in constants.unsourced()},
+              f"got {[c.name for c in constants.unsourced()]}")
+        check("simulated constants are not counted as unsourced",
+              "HBM_DEVICE_ENERGY" not in {c.name for c in constants.unsourced()})
 
-    poisoned = constants.energy_pj(float(constants.CXL_LINK_ENERGY_PJ_PER_BIT), 1024)
+        raised = False
+        try:
+            constants.require_sourced("a test result")
+        except RuntimeError as exc:
+            raised = "FAKE_TEST_CONSTANT" in str(exc)
+        check("require_sourced raises and names the missing constant", raised)
+
+        check("provenance report marks unsourced entries",
+              "TODO_PLACEHOLDER" in constants.provenance_report())
+    finally:
+        constants.ALL_CONSTANTS = real_all_constants
+
+    poisoned = constants.energy_pj(float(fake_placeholder), 1024)
     check("energy computed from a placeholder is NaN, never 0",
           math.isnan(poisoned), f"got {poisoned}")
-    check("provenance report marks unsourced entries",
-          "TODO_PLACEHOLDER" in constants.provenance_report())
 
     print("\n[unit conversions]")
     check("bytes -> bits is x8", constants.bits_from_bytes(10) == 80.0)
@@ -223,15 +241,36 @@ def main() -> int:
         write_run(cxl_root, "cxl_p1")
         write_run(cxl_root, "cxl_p100000", sim_seconds=1e-2)
         cxl_runs = [parse_run(p) for p in sorted(cxl_root.iterdir())]
-        cxl_model = build_tier_model(cxl_runs, "cxl")
-        check("cxl link energy is the unsourced constant, so NaN",
-              math.isnan(cxl_model.link_energy_pj_per_bit))
-        check("cxl total energy is therefore NaN, not the device energy alone",
-              math.isnan(cxl_model.total_energy_pj_per_bit),
-              f"got {cxl_model.total_energy_pj_per_bit}")
-        check("but cxl device energy is still a real number",
-              cxl_model.device_energy_pj_per_bit is not None
-              and not math.isnan(cxl_model.device_energy_pj_per_bit))
+
+        # build_tier_model reads constants.CXL_LINK_ENERGY_PJ_PER_BIT directly.
+        # This checks that an unsourced link constant poisons the cxl total --
+        # a mechanism worth testing regardless of whether that real constant
+        # happens to be sourced right now, so swap in a placeholder for it.
+        real_link_energy = constants.CXL_LINK_ENERGY_PJ_PER_BIT
+        constants.CXL_LINK_ENERGY_PJ_PER_BIT = constants.Constant(
+            name="CXL_LINK_ENERGY_PJ_PER_BIT", value=constants.PLACEHOLDER,
+            unit="pJ/bit", source="fixture for selftest", status="placeholder",
+        )
+        try:
+            cxl_model = build_tier_model(cxl_runs, "cxl")
+            check("cxl link energy is the unsourced constant, so NaN",
+                  math.isnan(cxl_model.link_energy_pj_per_bit))
+            check("cxl total energy is therefore NaN, not the device energy alone",
+                  math.isnan(cxl_model.total_energy_pj_per_bit),
+                  f"got {cxl_model.total_energy_pj_per_bit}")
+            check("but cxl device energy is still a real number",
+                  cxl_model.device_energy_pj_per_bit is not None
+                  and not math.isnan(cxl_model.device_energy_pj_per_bit))
+        finally:
+            constants.CXL_LINK_ENERGY_PJ_PER_BIT = real_link_energy
+
+        # And with the real (now-sourced) constant restored, the total should
+        # actually be a real number -- this is the state the project is in now.
+        cxl_model_real = build_tier_model(cxl_runs, "cxl")
+        check("with the link energy actually sourced, cxl total energy is real",
+              cxl_model_real.total_energy_pj_per_bit is not None
+              and not math.isnan(cxl_model_real.total_energy_pj_per_bit),
+              f"got {cxl_model_real.total_energy_pj_per_bit}")
 
         print("\n[sweep planning]")
         configs = root / "configs"

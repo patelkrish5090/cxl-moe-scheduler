@@ -108,21 +108,39 @@ class Constant:
 
 CXL_LINK_LATENCY_NS = Constant(
     name="CXL_LINK_LATENCY_NS",
-    value=PLACEHOLDER,  # TODO_PLACEHOLDER
+    value=200.0,
     unit="ns",
-    source="TODO_PLACEHOLDER: added read round-trip vs local DDR, from a CXL "
-           "Type 3 measurement study or vendor product brief. Note CXL rev, "
-           "PHY generation, and idle-vs-loaded.",
-    status="placeholder",
+    source="Round-trip latency a CXL Type 3 memory controller adds vs local "
+           "DDR, attributed to Siamak Tavallaei (CXL Consortium president), "
+           "quoted in 'Just How Bad Is CXL Memory Latency?', The Next "
+           "Platform, Dec 2022 (nextplatform.com/store/2022/12/05/"
+           "just-how-bad-is-cxl-memory-latency). Corroborated in the same "
+           "article by Astera Labs' Leo CXL controller field measurements "
+           "(170-250 ns) and GigaIO's observations of real CXL Type 3 "
+           "expansion modules (~250 ns). A general CXL 2.0-era figure, not "
+           "tied to one vendor/device or PHY generation; the source does not "
+           "state idle vs loaded, so treat this as a typical/representative "
+           "round trip, not a confirmed-idle figure -- revisit if a "
+           "loaded-latency number is needed for a saturated workload.",
+    status="cited",
 )
 
 CXL_LINK_ENERGY_PJ_PER_BIT = Constant(
     name="CXL_LINK_ENERGY_PJ_PER_BIT",
-    value=PLACEHOLDER,  # TODO_PLACEHOLDER
+    value=11.4,
     unit="pJ/bit",
-    source="TODO_PLACEHOLDER: PHY + protocol energy per bit for the CXL link, "
-           "excluding the DRAM device. Note per-direction vs aggregate.",
-    status="placeholder",
+    source="PCIe Gen5 (32 GT/s) SerDes energy including PLL and clocking, "
+           "from 'A 32Gb/s NRZ 37dB SerDes in 10nm CMOS to Support PCI "
+           "Express Gen 5 Protocol' (IEEE, "
+           "ieeexplore.ieee.org/document/9075947). Used as a proxy for CXL "
+           "PHY energy since CXL 2.0/3.0 runs over the PCIe 5.0/6.0 physical "
+           "layer -- this is PHY-level SerDes energy only, with no separate "
+           "figure available for CXL protocol-layer overhead on top of it. "
+           "Reported as a single per-lane SerDes figure; the source excerpt "
+           "does not confirm whether this is TX-only or a full transceiver, "
+           "so treat as one lane's aggregate figure rather than a confirmed "
+           "per-direction number.",
+    status="cited",
 )
 
 # ---------------------------------------------------------------------------
