@@ -184,17 +184,26 @@ def main() -> None:
           f"period {args.injection_period_ps} ps")
 
     # This is a HARD CAP on this generator state, not a safety-net value to set
-    # arbitrarily large: once data_limit is reached, gem5 doesn't transition to
-    # the next state (createExit) until this duration tick is reached, and the
-    # gap between them runs with nothing happening. A fixed huge duration (this
-    # used to be 10_000_000_000_000 unconditionally) creates a multi-trillion-
-    # tick idle gap that trips BaseTrafficGen's no-progress watchdog (default
-    # 1e9 ticks) well before the duration cap arrives, even though the transfer
-    # itself completed correctly. Size it to the actual expected transfer time
-    # instead, so it comfortably follows completion without leaving a huge gap.
+    # comfortably large: once data_limit is reached, gem5 does not transition to
+    # the next state (createExit) until this duration tick arrives, and nothing
+    # happens in between -- so what matters is the GAP between actual completion
+    # and this tick, not its size relative to the transfer. That gap must stay
+    # under BaseTrafficGen's no-progress watchdog (default 1e9 ticks), so even a
+    # 2x margin is wrong here: for any transfer taking longer than ~5e8 ticks,
+    # doubling it leaves a gap far bigger than 1e9. Use a small fixed margin
+    # instead, sized in packets rather than as a fraction of the whole transfer.
+    # The margin needs to absorb real backpressure/retry delay at fast
+    # (saturating) injection rates -- a tiny fixed margin risks the duration
+    # cap firing before data_limit is actually reached there, silently
+    # truncating the transfer for exactly the high-load points bandwidth
+    # measurement cares about. So it's generous (50% extra) but capped well
+    # under the 1e9-tick watchdog threshold, so the margin itself can never
+    # become the multi-billion-tick idle gap that caused this in the first
+    # place.
     n_packets = -(-args.transfer_bytes // args.block_bytes)  # ceil division
     expected_ticks = n_packets * args.injection_period_ps
-    duration_ticks = max(expected_ticks * 2, 1_000_000)
+    margin_ticks = min(max(expected_ticks // 2, 10 * args.injection_period_ps), 500_000_000)
+    duration_ticks = expected_ticks + margin_ticks
 
     def traffic():
         # 100% reads: an expert fetch is a pure read of weights into the GPU.
