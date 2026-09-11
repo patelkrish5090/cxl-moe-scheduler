@@ -15,13 +15,19 @@ THREE POLICIES:
                           its own docstring). Kept as an intermediate
                           comparison point, not the checkpoint-3 answer.
   energy-aware-evict   -- changes eviction itself: scores cached experts by
-                          (access frequency x refetch cost) instead of pure
-                          recency, so a rarely-used-but-still-recent expert
-                          can be evicted in favour of a cheaper-to-lose one.
-                          This is the one that can actually reduce total
-                          energy relative to naive (docs.md 6, checkpoint 3),
-                          because it changes which misses happen at all, not
-                          just when.
+                          (access frequency x refetch cost) / (age since last
+                          touch) instead of pure recency, so a
+                          rarely-used-but-still-recent expert can be evicted
+                          in favour of a more valuable one touched slightly
+                          longer ago. The age term is load-bearing, not a
+                          nicety: a pure-frequency (no decay) version of this
+                          was tried first and FAILED on the real Mixtral
+                          decode trace (7.1% more energy than naive, worse hit
+                          rate) from stale popularity -- see _SiteCache's
+                          docstring. This is the policy that can actually
+                          reduce total energy relative to naive (docs.md 6,
+                          checkpoint 3), because it changes which misses
+                          happen at all, not just when.
 
 WHAT THIS DOES NOT MODEL (be upfront about this wherever these numbers are
 quoted): dispatches are processed one at a time on a single simulated
@@ -149,6 +155,7 @@ class SimulationResult:
 class _Entry:
     refetch_cost_pj: float
     access_count: int
+    last_touched: int  # this site's local dispatch-clock reading at last touch
 
 
 class _SiteCache:
@@ -158,28 +165,50 @@ class _SiteCache:
     profiler/analyze.py::simulate_lru's semantics.
 
     eviction_policy="energy-aware" scores each candidate by
-    (access_count * refetch_cost_pj) instead of pure recency, and evicts the
-    minimum. WHY NOT COST ALONE: within one site, every expert has the same
+    (access_count * refetch_cost_pj) / age_since_last_touch and evicts the
+    minimum -- a recency-decayed frequency score (the GDSF,
+    Greedy-Dual-Size-Frequency, family of cache-replacement algorithms), not
+    plain frequency. WHY THE DECAY TERM IS LOAD-BEARING, NOT A NICETY: a first
+    version of this scored by (access_count * refetch_cost_pj) alone, with no
+    decay. On the real Mixtral decode trace that version FAILED docs.md 6
+    checkpoint 3 -- 7.1% MORE total energy than naive, and a WORSE hit rate
+    (25.8% vs naive's 31.7%). Diagnosis: an expert popular early in a 262K-
+    dispatch trace keeps a permanently high access_count and is never evicted
+    again even once the trace moves past needing it, while genuinely-current
+    experts get evicted prematurely because their count hasn't caught up yet
+    -- the classic "stale popularity" failure mode of pure LFU. The
+    hand-traced example in selftest.py didn't catch this because it has no
+    temporal drift; a 262K-dispatch real trace does. Dividing by
+    time-since-last-touch fixes it: a stale entry's score decays even with a
+    high historical count, while a genuinely-current one stays competitive.
+
+    WHY NOT COST ALONE: within one site, every expert has the same
     weight_bytes (hot_cold.csv's expert_weight_bytes is constant per site),
     so refetch_cost_pj is IDENTICAL across every candidate in a single
     eviction decision -- weighting by cost alone would degenerate to
     (constant) * nothing, i.e. no signal, i.e. an arbitrary tie-break. The
-    term that actually varies per expert is access frequency (that variation
-    is exactly what stage 1's gini/entropy skew measurements are about), so
-    frequency is the primary signal here; cost is kept in the formula because
-    it is the structurally correct term docs.md 4.5 asks for, and it WILL
-    differentiate candidates in a model whose experts vary in size (this
-    project's traces do not).
+    terms that actually vary per expert are access frequency (what stage 1's
+    gini/entropy skew measurements are about) and recency; cost is kept in
+    the formula because it is the structurally correct term docs.md 4.5 asks
+    for, and it WILL differentiate candidates in a model whose experts vary
+    in size (this project's traces do not).
     """
 
     def __init__(self, capacity: int, eviction_policy: EvictionPolicy = "lru"):
         self.capacity = max(capacity, 1)
         self.eviction_policy = eviction_policy
         self._entries: "OrderedDict[int, _Entry]" = OrderedDict()
+        self._clock = 0  # this site's own dispatch counter, advances on every hit() call
 
     def hit(self, expert_id: int) -> bool:
+        # The clock advances on every dispatch this site sees, hit or miss --
+        # "time passing" makes every OTHER cached entry one step staler
+        # regardless of whether this particular dispatch found its expert.
+        self._clock += 1
         if expert_id in self._entries:
-            self._entries[expert_id].access_count += 1
+            entry = self._entries[expert_id]
+            entry.access_count += 1
+            entry.last_touched = self._clock
             self._entries.move_to_end(expert_id)
             return True
         return False
@@ -187,8 +216,14 @@ class _SiteCache:
     def insert(self, expert_id: int, refetch_cost_pj: float) -> int | None:
         """Insert a freshly-fetched expert, evicting per eviction_policy if
         now over capacity. Returns the evicted expert_id, or None.
+
+        Only ever called immediately after a hit() that returned False for
+        the same dispatch, so self._clock has already been advanced for this
+        dispatch -- last_touched=self._clock is correct without a second tick.
         """
-        self._entries[expert_id] = _Entry(refetch_cost_pj=refetch_cost_pj, access_count=1)
+        self._entries[expert_id] = _Entry(
+            refetch_cost_pj=refetch_cost_pj, access_count=1, last_touched=self._clock
+        )
         self._entries.move_to_end(expert_id)
         if len(self._entries) <= self.capacity:
             return None
@@ -198,7 +233,15 @@ class _SiteCache:
         return self._evict_by_value()
 
     def _evict_by_value(self) -> int:
-        """Evict the entry with the smallest (access_count * refetch_cost_pj).
+        """Evict the entry with the smallest
+        (access_count * refetch_cost_pj) / (age_since_last_touch + 1).
+
+        The +1 avoids division by zero for an entry touched on this exact
+        dispatch (age 0) -- see insert()'s note on why the just-inserted entry
+        is itself a candidate here: it participates in the same eviction pass
+        that added it, which is correct (nothing exempts a fresh insert from
+        immediate re-eviction if its score really is the worst).
+
         NaN-safe: a NaN refetch cost (an unsourced tier constant) makes that
         entry's score NaN, and NaN comparisons are always False in Python, so
         a NaN-scored entry is never selected as the minimum by `<` -- it would
@@ -208,7 +251,8 @@ class _SiteCache:
         """
         worst_key, worst_score = None, math.inf
         for key, entry in self._entries.items():
-            score = entry.access_count * entry.refetch_cost_pj
+            age = self._clock - entry.last_touched + 1
+            score = (entry.access_count * entry.refetch_cost_pj) / age
             if math.isnan(score):
                 worst_key, worst_score = key, math.nan
                 break  # an unsourced-cost entry is the most urgent to flag, evict it first
