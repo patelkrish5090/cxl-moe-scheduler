@@ -114,7 +114,14 @@ def pick_device_config(configs_dir: Path, tier: str) -> Path:
         raise FileNotFoundError(f"no .ini device configs in {configs_dir}")
     for wanted in DEVICE_PREFERENCE[tier]:
         for path in available:
-            if wanted.lower() in path.name.lower():
+            # Exact match on the leading token (DRAMSim3 names configs
+            # "<TYPE>_<size>_<width>...ini"), not a bare substring check: "ddr5"
+            # is a substring of "gddr5x_8gb_x32.ini" (G-DDR5-X is graphics
+            # memory, an entirely different, wider-burst device class), which
+            # previously made the cxl tier silently pick GDDR5X over any real
+            # DDR5/DDR4 config and fail at runtime with a burst-size mismatch.
+            leading_token = path.stem.split("_")[0]
+            if leading_token.lower() == wanted.lower():
                 return path
     raise FileNotFoundError(
         f"no DRAMSim3 config for tier {tier!r} matching any of "
