@@ -1,6 +1,27 @@
-"""Replays a stage-1 trace through a per-site LRU expert cache under one of
-two policies, producing a decision log and aggregate energy/latency/throughput
+"""Replays a stage-1 trace through a per-site expert cache under one of three
+policies, producing a decision log and aggregate energy/latency/throughput
 figures.
+
+THREE POLICIES:
+
+  naive               -- LRU eviction, fetch every cold expert immediately.
+                          docs.md 4.5's baseline: "what prior capacity/
+                          latency-only systems effectively do."
+  energy-aware-defer   -- same LRU eviction as naive, but gates *when* a cold
+                          fetch happens against a replenishing power budget,
+                          deferring it under pressure. This changes fetch
+                          TIMING only, not WHAT gets cached -- so, by
+                          construction, it cannot change total energy (see
+                          its own docstring). Kept as an intermediate
+                          comparison point, not the checkpoint-3 answer.
+  energy-aware-evict   -- changes eviction itself: scores cached experts by
+                          (access frequency x refetch cost) instead of pure
+                          recency, so a rarely-used-but-still-recent expert
+                          can be evicted in favour of a cheaper-to-lose one.
+                          This is the one that can actually reduce total
+                          energy relative to naive (docs.md 6, checkpoint 3),
+                          because it changes which misses happen at all, not
+                          just when.
 
 WHAT THIS DOES NOT MODEL (be upfront about this wherever these numbers are
 quoted): dispatches are processed one at a time on a single simulated
@@ -24,7 +45,8 @@ import pandas as pd
 
 from .model import CostModel
 
-Policy = Literal["naive", "energy-aware"]
+Policy = Literal["naive", "energy-aware-defer", "energy-aware-evict"]
+EvictionPolicy = Literal["lru", "energy-aware"]
 
 #: W (watts) * ns -> pJ. 1 W = 1 J/s; over dt nanoseconds that is
 #: dt * 1e-9 J = dt * 1e-9 * 1e12 pJ = dt * 1e3 pJ.
@@ -97,12 +119,12 @@ class SimulationResult:
 
         This is the reference point for choosing --power-budget-w on a real
         trace: passing this run's own naive implied_avg_power_w as the
-        energy-aware budget reproduces roughly naive's own pace (near-zero
-        deferral); a materially smaller budget is what actually forces the
-        scheduler to trade latency for staying under a real power ceiling.
-        Picking a budget with no relation to this number (as a first guess
-        might) risks either changing nothing or deferring almost everything --
-        see scheduler/README.md's worked example.
+        energy-aware-defer budget reproduces roughly naive's own pace
+        (near-zero deferral); a materially smaller budget is what actually
+        forces the scheduler to trade latency for staying under a real power
+        ceiling. Picking a budget with no relation to this number (as a first
+        guess might) risks either changing nothing or deferring almost
+        everything -- see scheduler/README.md's worked example.
         """
         if self.total_latency_ns <= 0:
             return 0.0
@@ -123,28 +145,77 @@ class SimulationResult:
         }
 
 
+@dataclass
+class _Entry:
+    refetch_cost_pj: float
+    access_count: int
+
+
 class _SiteCache:
-    """One MoE layer's LRU expert cache. Starts empty and warms from the
-    trace -- capacity is sized from stage 1's hot-expert count, but nothing is
-    pinned; this is genuinely LRU-adaptive, matching
+    """One MoE layer's expert cache. Starts empty and warms from the trace --
+    capacity is sized from stage 1's hot-expert count, but nothing is pinned;
+    with eviction_policy="lru" this is exactly
     profiler/analyze.py::simulate_lru's semantics.
+
+    eviction_policy="energy-aware" scores each candidate by
+    (access_count * refetch_cost_pj) instead of pure recency, and evicts the
+    minimum. WHY NOT COST ALONE: within one site, every expert has the same
+    weight_bytes (hot_cold.csv's expert_weight_bytes is constant per site),
+    so refetch_cost_pj is IDENTICAL across every candidate in a single
+    eviction decision -- weighting by cost alone would degenerate to
+    (constant) * nothing, i.e. no signal, i.e. an arbitrary tie-break. The
+    term that actually varies per expert is access frequency (that variation
+    is exactly what stage 1's gini/entropy skew measurements are about), so
+    frequency is the primary signal here; cost is kept in the formula because
+    it is the structurally correct term docs.md 4.5 asks for, and it WILL
+    differentiate candidates in a model whose experts vary in size (this
+    project's traces do not).
     """
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, eviction_policy: EvictionPolicy = "lru"):
         self.capacity = max(capacity, 1)
-        self._entries: "OrderedDict[int, None]" = OrderedDict()
+        self.eviction_policy = eviction_policy
+        self._entries: "OrderedDict[int, _Entry]" = OrderedDict()
 
     def hit(self, expert_id: int) -> bool:
         if expert_id in self._entries:
+            self._entries[expert_id].access_count += 1
             self._entries.move_to_end(expert_id)
             return True
         return False
 
-    def insert(self, expert_id: int) -> None:
-        self._entries[expert_id] = None
+    def insert(self, expert_id: int, refetch_cost_pj: float) -> int | None:
+        """Insert a freshly-fetched expert, evicting per eviction_policy if
+        now over capacity. Returns the evicted expert_id, or None.
+        """
+        self._entries[expert_id] = _Entry(refetch_cost_pj=refetch_cost_pj, access_count=1)
         self._entries.move_to_end(expert_id)
-        if len(self._entries) > self.capacity:
-            self._entries.popitem(last=False)
+        if len(self._entries) <= self.capacity:
+            return None
+        if self.eviction_policy == "lru":
+            evicted, _ = self._entries.popitem(last=False)
+            return evicted
+        return self._evict_by_value()
+
+    def _evict_by_value(self) -> int:
+        """Evict the entry with the smallest (access_count * refetch_cost_pj).
+        NaN-safe: a NaN refetch cost (an unsourced tier constant) makes that
+        entry's score NaN, and NaN comparisons are always False in Python, so
+        a NaN-scored entry is never selected as the minimum by `<` -- it would
+        silently never be evicted, which is the wrong direction for a
+        placeholder. Guard explicitly instead of relying on comparison
+        semantics here.
+        """
+        worst_key, worst_score = None, math.inf
+        for key, entry in self._entries.items():
+            score = entry.access_count * entry.refetch_cost_pj
+            if math.isnan(score):
+                worst_key, worst_score = key, math.nan
+                break  # an unsourced-cost entry is the most urgent to flag, evict it first
+            if score < worst_score:
+                worst_key, worst_score = key, score
+        del self._entries[worst_key]
+        return worst_key
 
 
 def _run(
@@ -152,17 +223,18 @@ def _run(
     cost_model: CostModel,
     cache_capacity: dict[int, int],
     policy: Policy,
+    eviction_policy: EvictionPolicy,
     power_budget_w: float | None,
 ) -> SimulationResult:
-    if policy == "energy-aware" and (power_budget_w is None or power_budget_w <= 0):
-        raise ValueError("energy-aware policy requires power_budget_w > 0")
+    if policy == "energy-aware-defer" and (power_budget_w is None or power_budget_w <= 0):
+        raise ValueError("energy-aware-defer policy requires power_budget_w > 0")
 
-    caches = {site: _SiteCache(cap) for site, cap in cache_capacity.items()}
+    caches = {site: _SiteCache(cap, eviction_policy) for site, cap in cache_capacity.items()}
     result = SimulationResult(policy=policy)
 
     sim_time_ns = 0.0
-    # Only used by energy-aware; replenishes with sim_time_ns. Starting at
-    # exactly 0 is a deliberate cold-start: no power budget rate, however
+    # Only used by energy-aware-defer; replenishes with sim_time_ns. Starting
+    # at exactly 0 is a deliberate cold-start: no power budget rate, however
     # large, can deliver energy that has not yet had any simulated time to
     # accrue, so the very first cold dispatch can still see a (correctly)
     # negligible defer even under an enormous budget -- this is physically
@@ -173,6 +245,12 @@ def _run(
         site_idx = int(row.site_idx)
         expert_id = int(row.expert_id)
         cache = caches[site_idx]
+        # The cost to refetch THIS expert if it were evicted right now -- used
+        # by energy-aware-evict's scoring regardless of hit/miss, so a hit
+        # still refreshes the cache's bookkeeping (a no-op numerically today,
+        # since cost is deterministic per site/expert, but kept correct for a
+        # future dynamic cost model).
+        refetch_cost = cost_model.cost(site_idx, expert_id, "cxl").total_pj
 
         if cache.hit(expert_id):
             cost = cost_model.cost(site_idx, expert_id, "hbm")
@@ -189,7 +267,7 @@ def _run(
         wait_ns = 0.0
         deferred = False
 
-        if policy == "energy-aware":
+        if policy == "energy-aware-defer":
             # Budget replenishes continuously; NaN if link energy is
             # unsourced propagates through this comparison as False, which is
             # the safe direction -- it defers rather than silently spending an
@@ -205,14 +283,14 @@ def _run(
             energy_budget_pj -= cost.total_pj
 
         sim_time_ns += cost.latency_ns
-        cache.insert(expert_id)
+        cache.insert(expert_id, refetch_cost)
         result.decisions.append(Decision(
             token_uid=int(row.token_uid), site_idx=site_idx, expert_id=expert_id,
             hit=False, deferred=deferred, energy_pj=cost.total_pj, wait_ns=wait_ns,
             sim_time_ns=sim_time_ns,
         ))
 
-        if policy == "energy-aware":
+        if policy == "energy-aware-defer":
             # Budget keeps accruing at power_budget_w between dispatches too,
             # not just while waiting -- credit the fetch's own latency span.
             energy_budget_pj += cost.latency_ns * power_budget_w * _WATT_NS_TO_PJ
@@ -221,60 +299,116 @@ def _run(
 
 
 def run_naive(trace: pd.DataFrame, cost_model: CostModel, cache_capacity: dict[int, int]) -> SimulationResult:
-    """Fetch every cold expert immediately. No energy weighting -- this is
-    docs.md 4.5's baseline, "what prior capacity/latency-only systems
-    effectively do."
+    """LRU eviction, fetch every cold expert immediately. No energy weighting
+    at all -- this is docs.md 4.5's baseline, "what prior capacity/
+    latency-only systems effectively do."
     """
-    return _run(trace, cost_model, cache_capacity, "naive", power_budget_w=None)
+    return _run(trace, cost_model, cache_capacity, "naive", "lru", power_budget_w=None)
 
 
-def run_energy_aware(
+def run_energy_aware_defer(
     trace: pd.DataFrame, cost_model: CostModel, cache_capacity: dict[int, int], power_budget_w: float
 ) -> SimulationResult:
-    """Same LRU cache as :func:`run_naive`, but gates a cold fetch against a
-    continuously-replenishing power budget: if the fetch's E_total exceeds
-    what's currently available, it is deferred until enough has accrued.
+    """Same LRU cache and eviction as :func:`run_naive`, but gates a cold
+    fetch against a continuously-replenishing power budget: if the fetch's
+    E_total exceeds what's currently available, it is deferred until enough
+    has accrued.
+
+    This changes WHEN a fetch happens, never WHAT gets cached -- eviction
+    decisions are identical to naive's, so the same set of experts eventually
+    gets fetched at the same per-fetch cost either way. total_energy_pj is
+    therefore identical to naive's BY CONSTRUCTION; this policy trades latency
+    for staying under an instantaneous power ceiling, it does not reduce total
+    energy (docs.md 6 checkpoint 3 needs energy-aware-evict for that, not
+    this policy -- see module docstring).
     """
-    return _run(trace, cost_model, cache_capacity, "energy-aware", power_budget_w=power_budget_w)
+    return _run(trace, cost_model, cache_capacity, "energy-aware-defer", "lru", power_budget_w=power_budget_w)
 
 
-def diff_decisions(naive: SimulationResult, energy_aware: SimulationResult, max_examples: int = 10) -> str:
-    """Where the two policies' outcomes diverge for the same trace.
+def run_energy_aware_evict(
+    trace: pd.DataFrame, cost_model: CostModel, cache_capacity: dict[int, int]
+) -> SimulationResult:
+    """Energy-aware EVICTION: fetch every cold expert immediately (no
+    deferral -- isolating the eviction mechanism's effect on total energy
+    from the (energy-neutral) timing effect run_energy_aware_defer has), but
+    evict by (access_count * refetch_cost_pj) instead of pure recency.
+
+    This is the policy that can actually satisfy docs.md 6 checkpoint 3
+    (energy-aware total energy <= naive's): by changing which experts get
+    evicted, it can change how many misses happen at all, unlike deferral
+    alone. Whether it actually does so on a given trace is an empirical
+    question -- run it and check total_energy_pj against naive's, do not
+    assume it from the architecture (see scheduler/README.md's reported
+    numbers).
+    """
+    return _run(trace, cost_model, cache_capacity, "energy-aware-evict", "energy-aware", power_budget_w=None)
+
+
+def diff_decisions(a: SimulationResult, b: SimulationResult, max_examples: int = 10) -> str:
+    """Where two policies' outcomes diverge for the same trace.
 
     The two runs process the identical dispatch sequence, so decisions line up
-    index-for-index. A LRU cache is order-sensitive: once the energy-aware
-    policy defers one fetch, subsequent arrivals can shift what's resident by
-    the time that fetch happens, so hit/miss outcomes can genuinely diverge
-    downstream of a single deferral -- that divergence is the real point of
-    this comparison, not a bug.
+    index-for-index. Either cache policy is order-sensitive: once one run
+    defers a fetch or evicts differently, subsequent arrivals can shift what's
+    resident by the time a later dispatch happens, so hit/miss outcomes can
+    genuinely diverge downstream of a single decision -- that divergence is
+    the real point of this comparison, not a bug.
     """
-    if len(naive.decisions) != len(energy_aware.decisions):
-        return (f"cannot diff: naive has {len(naive.decisions)} decisions, "
-                f"energy-aware has {len(energy_aware.decisions)} -- not the same trace")
+    if len(a.decisions) != len(b.decisions):
+        return (f"cannot diff: {a.policy} has {len(a.decisions)} decisions, "
+                f"{b.policy} has {len(b.decisions)} -- not the same trace")
 
-    lines = ["DECISION DIFF -- naive vs energy-aware, same trace", "=" * 60]
+    lines = [f"DECISION DIFF -- {a.policy} vs {b.policy}, same trace", "=" * 60]
     diverged = 0
     examples: list[str] = []
-    for n, e in zip(naive.decisions, energy_aware.decisions):
-        if n.hit != e.hit or e.deferred:
+    for da, db in zip(a.decisions, b.decisions):
+        if da.hit != db.hit or db.deferred:
             diverged += 1
             if len(examples) < max_examples:
                 examples.append(
-                    f"  token {n.token_uid} site {n.site_idx} expert {n.expert_id}: "
-                    f"naive={'hit' if n.hit else 'miss'} "
-                    f"energy-aware={'hit' if e.hit else 'miss'}"
-                    f"{' (deferred ' + f'{e.wait_ns:.1f}ns)' if e.deferred else ''}"
+                    f"  token {da.token_uid} site {da.site_idx} expert {da.expert_id}: "
+                    f"{a.policy}={'hit' if da.hit else 'miss'} "
+                    f"{b.policy}={'hit' if db.hit else 'miss'}"
+                    f"{' (deferred ' + f'{db.wait_ns:.1f}ns)' if db.deferred else ''}"
                 )
 
-    lines.append(f"{diverged} / {len(naive.decisions)} dispatches diverged "
-                 f"(different hit/miss outcome, or an energy-aware deferral)")
+    lines.append(f"{diverged} / {len(a.decisions)} dispatches diverged "
+                 f"(different hit/miss outcome, or a deferral)")
     lines.extend(examples)
     if diverged > max_examples:
         lines.append(f"  ... and {diverged - max_examples} more")
 
     lines.append("")
-    lines.append(f"{'metric':<20}{'naive':>18}{'energy-aware':>18}")
+    lines.append(f"{'metric':<20}{a.policy:>22}{b.policy:>22}")
     for key in ("total_energy_pj", "total_latency_ns", "hit_rate", "n_deferred"):
-        nv, ev = getattr(naive, key), getattr(energy_aware, key)
-        lines.append(f"{key:<20}{nv:>18.4g}{ev:>18.4g}")
+        av, bv = getattr(a, key), getattr(b, key)
+        lines.append(f"{key:<20}{av:>22.6g}{bv:>22.6g}")
+    return "\n".join(lines)
+
+
+def three_way_report(naive: SimulationResult, defer: SimulationResult, evict: SimulationResult) -> str:
+    """docs.md 6 checkpoint 3's required report: total energy for all three
+    policies on the same trace, with an explicit PASS/FAIL against naive's.
+    """
+    lines = ["THREE-WAY COMPARISON -- docs.md 6, checkpoint 3", "=" * 70]
+    lines.append(f"{'policy':<22}{'total_energy_pj':>20}{'total_latency_ns':>20}{'hit_rate':>12}")
+    for r in (naive, defer, evict):
+        lines.append(f"{r.policy:<22}{r.total_energy_pj:>20.6g}{r.total_latency_ns:>20.6g}{r.hit_rate:>12.4f}")
+
+    lines.append("")
+    if math.isnan(evict.total_energy_pj) or math.isnan(naive.total_energy_pj):
+        lines.append("CHECKPOINT 3: UNDECIDED -- a NaN energy total means an unsourced "
+                      "constant is involved; see memsim.cli provenance.")
+    else:
+        passed = evict.total_energy_pj <= naive.total_energy_pj
+        delta_pct = 100.0 * (naive.total_energy_pj - evict.total_energy_pj) / naive.total_energy_pj
+        lines.append(
+            f"CHECKPOINT 3: {'PASSED' if passed else 'FAILED'} -- "
+            f"energy-aware-evict total energy is "
+            f"{'lower' if passed else 'HIGHER'} than naive's by {abs(delta_pct):.2f}%"
+        )
+        if not passed:
+            lines.append("  The placement logic is not reducing total energy on this trace -- "
+                          "see scheduler/README.md's eviction-policy section before trusting "
+                          "this scheduler's energy claims.")
     return "\n".join(lines)

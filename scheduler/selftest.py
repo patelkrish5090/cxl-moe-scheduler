@@ -25,7 +25,14 @@ from .model import (
     load_tier_model,
     load_trace,
 )
-from .simulate import _SiteCache, diff_decisions, run_energy_aware, run_naive
+from .simulate import (
+    _SiteCache,
+    diff_decisions,
+    run_energy_aware_defer,
+    run_energy_aware_evict,
+    run_naive,
+    three_way_report,
+)
 
 failures: list[str] = []
 
@@ -92,16 +99,38 @@ def main() -> int:
           math.isnan(nan_cost.total_pj), f"got {nan_cost.total_pj}")
 
     print("\n[LRU site cache]")
-    cache = _SiteCache(capacity=2)
+    cache = _SiteCache(capacity=2, eviction_policy="lru")
     check("miss on empty cache", not cache.hit(1))
-    cache.insert(1)
+    cache.insert(1, refetch_cost_pj=10.0)
     check("hit after insert", cache.hit(1))
-    cache.insert(2)
+    cache.insert(2, refetch_cost_pj=10.0)
     check("second insert still hits first (capacity 2)", cache.hit(1))
-    cache.insert(3)  # evicts 2 (1 was just touched by the hit above, so 2 is LRU)
+    cache.insert(3, refetch_cost_pj=10.0)  # evicts 2 (1 was just touched above, so 2 is LRU)
     check("inserting a third entry evicts the true LRU one", not cache.hit(2))
     check("the recently-touched entry survives eviction", cache.hit(1))
     check("the newest entry is present", cache.hit(3))
+
+    print("\n[energy-aware site cache: eviction scoring]")
+    # capacity 2, all same cost -> score is purely access_count. A is accessed
+    # 3x, B once; both are in cache when C arrives and forces an eviction.
+    # Frequency-weighted eviction must keep the more valuable A and drop B,
+    # the opposite of what plain LRU (recency only) would do here since B was
+    # touched more recently than A.
+    ecache = _SiteCache(capacity=2, eviction_policy="energy-aware")
+    ecache.insert(1, refetch_cost_pj=10.0)
+    ecache.hit(1)
+    ecache.hit(1)  # expert 1: access_count now 3
+    ecache.insert(2, refetch_cost_pj=10.0)  # expert 2: access_count 1, room for both, no eviction
+    evicted = ecache.insert(3, refetch_cost_pj=10.0)  # forces an eviction
+    check("energy-aware eviction drops the low-frequency entry, not the recent one",
+          evicted == 2, f"evicted {evicted}, expected 2 (low frequency) not 1 (high frequency)")
+    check("the high-frequency entry survives", ecache.hit(1))
+
+    nan_cache = _SiteCache(capacity=1, eviction_policy="energy-aware")
+    nan_cache.insert(1, refetch_cost_pj=math.nan)
+    nan_evicted = nan_cache.insert(2, refetch_cost_pj=10.0)
+    check("a NaN-cost entry (unsourced constant) is evicted first, not kept forever",
+          nan_evicted == 1, f"evicted {nan_evicted}")
 
     print("\n[naive policy: independent recompute]")
     # 2 sites, hand-traceable sequence. Site 0 cache capacity 1: expert 1 then
@@ -133,46 +162,83 @@ def main() -> int:
           math.isclose(result_hit.decisions[1].energy_pj, hbm_cost.total_pj))
     check("hit_rate reflects exactly 1 of 2 dispatches", result_hit.hit_rate == 0.5)
 
-    print("\n[energy-aware policy]")
+    print("\n[energy-aware-defer policy]")
     # Budget large enough to never defer: should match naive exactly, dispatch
     # for dispatch, since it's the same LRU policy underneath.
-    result_rich = run_energy_aware(trace, cm, cache_capacity={0: 1}, power_budget_w=1e12)
+    result_rich = run_energy_aware_defer(trace, cm, cache_capacity={0: 1}, power_budget_w=1e12)
     # The budget starts at exactly 0 pJ at sim_time=0: no rate, however large,
     # can deliver energy that hasn't had any time to accrue yet, so the very
     # first cold dispatch from a standing start may still defer -- correctly,
     # just negligibly (see simulate.py's _run docstring). What an "enormous
     # budget defers nothing meaningful" actually promises is that any such
     # deferral is vanishingly small, not that none is ever recorded.
-    check("energy-aware with an enormous budget defers nothing meaningful",
+    check("energy-aware-defer with an enormous budget defers nothing meaningful",
           result_rich.n_deferred <= 1 and result_rich.total_wait_ns < 1.0,
           f"got {result_rich.n_deferred} deferrals, {result_rich.total_wait_ns} ns total wait")
-    check("energy-aware with an enormous budget matches naive's hit pattern",
+    check("energy-aware-defer with an enormous budget matches naive's hit pattern",
           [d.hit for d in result_rich.decisions] == [d.hit for d in result.decisions])
+    check("energy-aware-defer with an enormous budget matches naive's total energy "
+          "(deferral cannot change energy, only timing -- see run_energy_aware_defer's docstring)",
+          math.isclose(result_rich.total_energy_pj, result.total_energy_pj))
 
     # Budget of exactly 0 can never afford anything -- every miss must defer.
-    result_poor = run_energy_aware(trace, cm, cache_capacity={0: 1}, power_budget_w=1e-30)
-    check("energy-aware with a near-zero budget defers every miss",
+    result_poor = run_energy_aware_defer(trace, cm, cache_capacity={0: 1}, power_budget_w=1e-30)
+    check("energy-aware-defer with a near-zero budget defers every miss",
           all(d.deferred for d in result_poor.decisions if not d.hit))
     check("even a deferred fetch eventually happens (still recorded)",
           result_poor.n_dispatches == result.n_dispatches)
 
-    check("energy-aware requires a positive power budget", _raises_on_bad_budget(trace, cm))
+    check("energy-aware-defer requires a positive power budget", _raises_on_bad_budget(trace, cm))
 
-    print("\n[energy-aware: budget invariant]")
+    print("\n[energy-aware-defer: budget invariant]")
     # No dispatch should ever report an energy cost the budget couldn't have
     # covered at the moment it was charged -- check via a moderate budget that
     # produces a mix of immediate and deferred fetches.
     mixed_trace = _make_trace([(i, 0, i % 3) for i in range(9)])
-    mixed = run_energy_aware(mixed_trace, cm, cache_capacity={0: 2}, power_budget_w=1e6)
+    mixed = run_energy_aware_defer(mixed_trace, cm, cache_capacity={0: 2}, power_budget_w=1e6)
     check("a moderate budget produces at least one deferral on a busy trace",
           mixed.n_deferred > 0, f"got {mixed.n_deferred} deferrals among {mixed.n_dispatches}")
     check("wait_ns is always non-negative",
           all(d.wait_ns >= 0 for d in mixed.decisions))
     check("only misses ever carry a wait", all(d.wait_ns == 0 for d in mixed.decisions if d.hit))
 
+    print("\n[energy-aware-evict policy: checkpoint 3]")
+    # Hand-traced sequence, capacity 2: A is hot (4 touches), B is cold (1
+    # touch), then C forces an eviction while both are resident. B was touched
+    # MORE RECENTLY than A (at step 5 vs A's last touch at step 4), so plain
+    # LRU evicts the valuable, frequently-used A in favour of keeping the
+    # barely-used B -- exactly the wrong call. Frequency-weighted eviction
+    # keeps A and drops B instead. The payoff shows up at step 7: A is
+    # requested again, a hit for energy-aware-evict, a miss for naive/LRU.
+    ckpt3_trace = _make_trace([
+        (0, 0, 11), (1, 0, 11), (2, 0, 11), (3, 0, 11),  # A x4
+        (4, 0, 22),                                       # B x1
+        (5, 0, 33),                                       # C forces an eviction
+        (6, 0, 11),                                       # A again
+    ])
+    ckpt3_naive = run_naive(ckpt3_trace, cm, cache_capacity={0: 2})
+    ckpt3_evict = run_energy_aware_evict(ckpt3_trace, cm, cache_capacity={0: 2})
+
+    check("hand-traced: naive/LRU evicts the frequent expert, so the last access misses",
+          not ckpt3_naive.decisions[-1].hit, "expected naive's last dispatch (A again) to miss")
+    check("hand-traced: energy-aware-evict keeps the frequent expert, so the last access hits",
+          ckpt3_evict.decisions[-1].hit, "expected energy-aware-evict's last dispatch (A again) to hit")
+    check("hand-traced: energy-aware-evict has fewer total misses than naive on this trace",
+          ckpt3_evict.n_misses < ckpt3_naive.n_misses,
+          f"naive misses={ckpt3_naive.n_misses}, evict misses={ckpt3_evict.n_misses}")
+    check("hand-traced: energy-aware-evict's total energy is strictly lower than naive's "
+          "(docs.md 6 checkpoint 3, demonstrated on a constructed example)",
+          ckpt3_evict.total_energy_pj < ckpt3_naive.total_energy_pj,
+          f"naive={ckpt3_naive.total_energy_pj}, evict={ckpt3_evict.total_energy_pj}")
+
+    ckpt3_defer = run_energy_aware_defer(ckpt3_trace, cm, cache_capacity={0: 2}, power_budget_w=1e12)
+    report_text = three_way_report(ckpt3_naive, ckpt3_defer, ckpt3_evict)
+    check("three_way_report declares checkpoint 3 PASSED on the hand-traced example",
+          "PASSED" in report_text, report_text)
+
     print("\n[decision diff]")
     diff_text = diff_decisions(result, result_poor)
-    check("diff report names both policies", "naive" in diff_text and "energy-aware" in diff_text)
+    check("diff report names both policies", "naive" in diff_text and "energy-aware-defer" in diff_text)
     check("diff report counts every dispatch as diverged when every miss defers",
           f"{result.n_dispatches} / {result.n_dispatches}" in diff_text
           or "diverged" in diff_text)
@@ -237,7 +303,7 @@ def main() -> int:
 
 def _raises_on_bad_budget(trace: pd.DataFrame, cm: CostModel) -> bool:
     try:
-        run_energy_aware(trace, cm, cache_capacity={0: 1}, power_budget_w=0.0)
+        run_energy_aware_defer(trace, cm, cache_capacity={0: 1}, power_budget_w=0.0)
     except ValueError:
         return True
     return False
