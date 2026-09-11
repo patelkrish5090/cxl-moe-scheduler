@@ -28,11 +28,20 @@ DEFAULT_THIRD_PARTY = REPO_ROOT / "third_party"
 TIER_CONFIG = REPO_ROOT / "memsim" / "gem5_configs" / "tier.py"
 DEFAULT_OUT = REPO_ROOT / "memsim" / "out"
 
-#: Injection periods in picoseconds, fastest first. 1 ps issues a request every
-#: tick (saturating); 100000 ps is one request per 100 ns, far below what either
-#: tier can serve, so the memory system is idle and the measured latency is the
-#: unloaded one.
-DEFAULT_PERIODS_PS = (1, 100, 1_000, 10_000, 100_000)
+#: Injection periods in picoseconds, fastest first. 100000 ps is one request
+#: per 100 ns, far below what either tier can serve, so the memory system is
+#: idle and the measured latency is the unloaded one.
+#:
+#: 1 ps was dropped from this list: it asks for a request every tick, which no
+#: real memory system can sustain, so gem5's traffic generator only ever
+#: completes a handful of packets (observed: 617, ~39 KB) before its duration
+#: budget runs out -- nowhere near enough for a steady-state sample. Since
+#: memsim.compare takes "peak bandwidth" from the fastest point in this tuple,
+#: leaving 1 ps in here made every peak-bandwidth figure come from the least
+#: reliable sample instead of the largest one. 100 ps already saturates (its
+#: measured bandwidth is close to 1000 ps's, both near this tier's real ceiling)
+#: while still completing a multi-megabyte sample.
+DEFAULT_PERIODS_PS = (100, 1_000, 10_000, 100_000)
 
 #: DRAMSim3 device configs to prefer per tier, most preferred first. Matched as
 #: case-insensitive substrings against the .ini file names DRAMSim3 ships, because
