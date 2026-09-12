@@ -45,6 +45,7 @@ from scheduler.simulate import (
     EvictionDivergenceReport,
     SimulationResult,
     eviction_divergence_report,
+    latency_breakdown,
     run_energy_aware_evict,
     run_hbm_only,
     run_naive,
@@ -60,16 +61,21 @@ _PJ_TO_MJ = 1e-9
 #: CLAUDE.md flags (ns/us/ms mixups in latency code, not just energy code).
 _NS_TO_MS = 1e-6
 
-#: Above this, avg_latency_ms_per_token is flagged implausible rather than
-#: silently trusted. Not a claim that latencies above this are impossible --
-#: this simulator's own documented "no overlap, one dispatch at a time"
-#: model (scheduler/README.md's "What this does not model") combined with a
-#: real, slow measured CXL bandwidth CAN legitimately produce numbers this
-#: large (a real run: ~6.8 s/token on the Mixtral decode trace, walked back
-#: to 2.36 GB/s CXL bandwidth x 179,090 sequential 352 MB fetches with zero
-#: concurrency -- see experiments/README.md). The point of this ceiling is to
-#: force that explanation to be checked and stated explicitly every time,
-#: not to assert the number is wrong.
+#: Above this, avg_latency_ms_per_token is flagged rather than silently
+#: trusted. NOT a claim that latencies above this are impossible: this
+#: simulator's own documented "no overlap, one dispatch at a time" model
+#: (scheduler/README.md's "What this does not model") combined with a real,
+#: slow measured CXL bandwidth CAN legitimately produce numbers this large (a
+#: real run: ~6.8 s/token on the Mixtral decode trace, walked back to 2.36
+#: GB/s CXL bandwidth x 179,090 sequential 352 MB fetches with zero
+#: concurrency -- see experiments/README.md). ConfigResult.from_simulation
+#: backs this up with scheduler.simulate.latency_breakdown every time the
+#: ceiling fires, rather than leaving "check units" as a manual step: if the
+#: independently-recomputed total disagrees with the reported one
+#: (latency_accounting_consistent is False), THAT is the units/accounting
+#: bug, named explicitly. If they agree, the warning states the fully-serial
+#: no-overlap explanation as the determined cause, with the actual
+#: hit/miss/mean-cold-fetch numbers behind it, not just "check units."
 LATENCY_SANITY_CEILING_MS = 1000.0
 
 
@@ -87,11 +93,17 @@ class ConfigResult:
     avg_latency_ns_per_token: float
     avg_latency_ms_per_token: float
     throughput_tokens_per_sec: float
+    n_hits: int
+    n_misses: int
+    mean_miss_latency_ns: float
+    latency_accounting_consistent: bool
     latency_plausible: bool
     latency_warning: str | None
 
     @classmethod
-    def from_simulation(cls, config: str, result: SimulationResult, n_tokens: int) -> "ConfigResult":
+    def from_simulation(
+        cls, config: str, result: SimulationResult, n_tokens: int, cost_model: CostModel,
+    ) -> "ConfigResult":
         total_latency_ns = result.total_latency_ns
         avg_latency_ns = total_latency_ns / n_tokens if n_tokens else math.nan
         avg_latency_ms = avg_latency_ns * _NS_TO_MS
@@ -100,17 +112,37 @@ class ConfigResult:
         # separately need to be gotten right at two call sites.
         throughput = n_tokens / (total_latency_ns * 1e-9) if total_latency_ns > 0 else math.nan
 
+        breakdown = latency_breakdown(result, cost_model)
+
         plausible = not (avg_latency_ms > LATENCY_SANITY_CEILING_MS)  # NaN-safe: `not (nan > x)` is True
         warning = None
         if not plausible:
-            warning = (
-                f"avg latency {avg_latency_ms:,.1f} ms/token exceeds the "
-                f"{LATENCY_SANITY_CEILING_MS:,.0f} ms/token sanity ceiling. Before trusting this "
-                "number: check units first (ns vs ms vs s), then check whether this simulator's "
-                "documented no-overlap/no-concurrency model (scheduler/README.md) plus a slow "
-                "measured tier bandwidth explains it -- see LATENCY_SANITY_CEILING_MS's docstring "
-                "in experiments/harness.py for a real example this happened on."
-            )
+            if not breakdown.accounting_consistent:
+                warning = (
+                    f"avg latency {avg_latency_ms:,.1f} ms/token exceeds the "
+                    f"{LATENCY_SANITY_CEILING_MS:,.0f} ms/token sanity ceiling, AND the "
+                    "independently-recomputed total latency disagrees with the reported total by "
+                    f"{breakdown.discrepancy_pct:.2f}% (reported {breakdown.reported_total_latency_ns:,.0f} ns, "
+                    f"recomputed {breakdown.recomputed_total_latency_ns:,.0f} ns) -- this IS a units/"
+                    "accounting bug, not a modelling artifact. See scheduler.simulate.latency_breakdown."
+                )
+            else:
+                dispatches_per_token = result.n_dispatches / n_tokens if n_tokens else math.nan
+                warning = (
+                    f"avg latency {avg_latency_ms:,.1f} ms/token exceeds the "
+                    f"{LATENCY_SANITY_CEILING_MS:,.0f} ms/token sanity ceiling. Determined cause: this is "
+                    "NOT a units bug -- scheduler.simulate.latency_breakdown's independently-recomputed "
+                    "total agrees with the reported one, ruling out a double-counted/dropped dispatch. It "
+                    "is a real consequence of this simulator's fully-serial, no-overlap timing model "
+                    f"(scheduler/README.md) at this run's own measured figures: {dispatches_per_token:.1f} "
+                    f"dispatches/token, {result.hit_rate:.1%} hit rate, "
+                    f"{breakdown.mean_miss_latency_ns * _NS_TO_MS:,.2f} ms per cold fetch -- "
+                    f"{dispatches_per_token:.1f} x (1 - {result.hit_rate:.3f}) x "
+                    f"{breakdown.mean_miss_latency_ns * _NS_TO_MS:,.2f} ms ~= {avg_latency_ms:,.1f} ms/token. "
+                    "Every cold expert fetch is modelled as fully serial with no overlap across layers, "
+                    "experts, or tokens -- see LATENCY_SANITY_CEILING_MS's docstring in "
+                    "experiments/harness.py."
+                )
 
         return cls(
             config=config,
@@ -123,6 +155,10 @@ class ConfigResult:
             avg_latency_ns_per_token=avg_latency_ns,
             avg_latency_ms_per_token=avg_latency_ms,
             throughput_tokens_per_sec=throughput,
+            n_hits=breakdown.n_hits,
+            n_misses=breakdown.n_misses,
+            mean_miss_latency_ns=breakdown.mean_miss_latency_ns,
+            latency_accounting_consistent=breakdown.accounting_consistent,
             latency_plausible=plausible,
             latency_warning=warning,
         )
@@ -238,8 +274,10 @@ def run_comparison(run_dir: str | Path, tier_model_path: str | Path) -> Comparis
 
     return ComparisonResult(
         run_name=run_dir.name,
-        hbm_only=ConfigResult.from_simulation("hbm_only", hbm_only_sim, n_tokens),
-        hbm_cxl_naive=ConfigResult.from_simulation("hbm_cxl_naive", naive_sim, n_tokens),
-        hbm_cxl_energy_aware=ConfigResult.from_simulation("hbm_cxl_energy_aware", evict_sim, n_tokens),
+        hbm_only=ConfigResult.from_simulation("hbm_only", hbm_only_sim, n_tokens, cost_model),
+        hbm_cxl_naive=ConfigResult.from_simulation("hbm_cxl_naive", naive_sim, n_tokens, cost_model),
+        hbm_cxl_energy_aware=ConfigResult.from_simulation(
+            "hbm_cxl_energy_aware", evict_sim, n_tokens, cost_model
+        ),
         eviction_divergence=divergence,
     )

@@ -54,11 +54,23 @@ empty chart (CLAUDE.md).
    as an interactive Plotly heatmap instead — hover a cell to read its exact
    share, rather than reading a fixed color scale off a saved image.
 4. **Activation skew summary** — the heatmap alone reads as fairly flat by
-   eye at Mixtral's scale (32 experts x many layers), so this adds a number:
+   eye at Mixtral's scale (32 layers x 8 experts), so this adds a number:
    overall Gini coefficient and max/mean dispatch ratio
    (`dashboard.data.build_expert_skew_summary`, reusing
-   `profiler.classify.gini`), plus the top-5 and bottom-5 experts by total
-   dispatch share summed across all layers.
+   `profiler.classify.gini`), plus the top-5 and bottom-5 individual
+   (layer, expert) bins by share of all dispatches in the run. Computed at
+   the SAME granularity as `profiler.classify`'s own `gini_overall` — one
+   independent bin per (layer, expert) pair, never summed by expert_id
+   across layers first. An earlier version of this function did exactly
+   that cross-layer sum before measuring skew, and it silently erased the
+   very signal this checkpoint exists to catch: Mixtral routes each layer
+   somewhat independently (arXiv:2401.04088 sec. 5), so two layers that are
+   each genuinely, strongly skewed toward a *different* expert average out
+   toward uniform once collapsed into per-expert totals. See
+   `build_expert_skew_summary`'s docstring and `dashboard/selftest.py`'s
+   "cross-layer washout regression" test, which reproduces that exact bug on
+   a constructed example (two maximally-skewed layers with identical
+   per-expert totals, correctly still reported as skewed, not uniform).
 
 ## Architecture
 
@@ -87,9 +99,10 @@ directory with no `hot_cold.csv` (an empty placeholder, not a real
 completed run), that `build_heatmap_grid`'s pivot matches its source values
 exactly, that `load_comparison_payload` carries the `checkpoint3` and
 `eviction_divergence` sections through untouched, and that
-`build_expert_skew_summary`'s per-expert totals, Gini, and max/mean ratio
+`build_expert_skew_summary`'s per-(layer,expert)-bin Gini and max/mean ratio
 match an independent recompute (including the degenerate perfectly-uniform
-case, where Gini must be exactly 0 and the ratio exactly 1.0).
+case, where Gini must be exactly 0 and the ratio exactly 1.0, and the
+cross-layer washout regression case described above).
 
 The app itself (`dashboard/app.py`) was verified headlessly with
 Streamlit's own `streamlit.testing.v1.AppTest` during development, both

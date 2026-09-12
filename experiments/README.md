@@ -55,15 +55,31 @@ Needs `memsim/tier_model.json` to already exist (stage 2's
 
 `ConfigResult.latency_plausible` / `latency_warning`: if
 `avg_latency_ms_per_token` exceeds `LATENCY_SANITY_CEILING_MS` (default 1000
-ms/token), the result is flagged rather than silently trusted. This is NOT a
-claim that latencies above the ceiling are wrong — on the real
-`mixtral_8x7b_decode` trace, `hbm_cxl_naive`'s ~6.8 s/token figure is real,
-walked back to a real, slow measured CXL bandwidth (2.36 GB/s) times 179,090
-sequential 352 MB expert fetches with zero concurrency, under this
-simulator's own documented "no overlap" model. The ceiling exists to force
-that explanation to be checked and stated every time a number this large
-shows up, not to assert it's impossible — see `LATENCY_SANITY_CEILING_MS`'s
-docstring in `experiments/harness.py`.
+ms/token), the result is flagged rather than silently trusted. This does NOT
+stop at "check units" as a manual step — `ConfigResult.from_simulation` calls
+`scheduler.simulate.latency_breakdown` every time the ceiling fires, which
+independently recomputes the total latency from each decision's own tier
+cost (a separate summation than the simulation loop's own running clock) and
+compares it to the reported total:
+
+- If they **disagree** (`latency_accounting_consistent` is `False`), the
+  warning states plainly that this IS a units/accounting bug, with both
+  numbers and the discrepancy percentage, and points at
+  `scheduler.simulate.latency_breakdown`.
+- If they **agree**, the warning states the determined, non-bug cause: this
+  simulator's own documented "no overlap, one dispatch at a time" model
+  (`scheduler/README.md`'s "WHAT THIS DOES NOT MODEL") combined with a real,
+  slow measured CXL bandwidth, and shows the actual arithmetic
+  (`dispatches_per_token x (1 - hit_rate) x mean_miss_latency_ms`) that
+  produces the number — not just an assertion that it's fine.
+
+On the real `mixtral_8x7b_decode` trace, `hbm_cxl_naive`'s ~6.8 s/token
+figure is exactly this second case: accounting is consistent, walked back to
+a real, slow measured CXL bandwidth (2.36 GB/s) times 179,090 sequential
+352 MB expert fetches with zero concurrency. `ConfigResult.n_hits`,
+`n_misses`, and `mean_miss_latency_ns` are always available (not only when
+the ceiling fires) for exactly this kind of manual sanity check — see
+`LATENCY_SANITY_CEILING_MS`'s docstring in `experiments/harness.py`.
 
 ## Checkpoint 3 gap and eviction divergence
 

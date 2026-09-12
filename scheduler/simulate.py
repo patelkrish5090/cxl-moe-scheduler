@@ -157,6 +157,77 @@ class SimulationResult:
         }
 
 
+@dataclass(frozen=True)
+class LatencyBreakdown:
+    """Independent cross-check of a SimulationResult's total_latency_ns, plus
+    the transparent hit/miss decomposition behind an implausible-looking
+    figure -- the direct evidence for whether a large avg_latency_ms_per_token
+    (experiments/harness.py's LATENCY_SANITY_CEILING_MS) is a units/accounting
+    bug or a real consequence of this simulator's documented fully-serial,
+    no-overlap timing model (see the "WHAT THIS DOES NOT MODEL" note at the
+    top of this file).
+
+    recomputed_total_latency_ns is derived by re-deriving each decision's own
+    tier cost and summing independently of _run()'s own running clock -- built
+    from the SAME per-dispatch cost_model.cost() calls _run() uses (so it
+    cannot catch a formula-level bug inside CostModel.cost() itself -- that was
+    checked separately, see scheduler/model.py's cost() docstring), but a
+    SEPARATE summation than the simulation loop's own accumulator. If these
+    two disagree, that is exactly what a double-counted or dropped dispatch in
+    _run() would look like -- accounting_consistent being True across every
+    real run this project has produced is exactly what rules that out.
+    """
+
+    n_hits: int
+    n_misses: int
+    mean_hit_latency_ns: float
+    mean_miss_latency_ns: float
+    reported_total_latency_ns: float
+    recomputed_total_latency_ns: float
+
+    @property
+    def discrepancy_pct(self) -> float:
+        if self.reported_total_latency_ns == 0:
+            return 0.0 if self.recomputed_total_latency_ns == 0 else math.nan
+        return (
+            100.0 * abs(self.reported_total_latency_ns - self.recomputed_total_latency_ns)
+            / self.reported_total_latency_ns
+        )
+
+    @property
+    def accounting_consistent(self) -> bool:
+        """True if the reported and independently-recomputed totals agree to
+        within 0.01% -- NOT a claim that the latency figure itself is small or
+        plausible, only that it is not the product of an accumulation bug.
+        """
+        return self.discrepancy_pct < 0.01
+
+
+def latency_breakdown(result: SimulationResult, cost_model: CostModel) -> LatencyBreakdown:
+    """Build a :class:`LatencyBreakdown` for ``result`` (a run_naive /
+    run_energy_aware_evict / run_hbm_only / run_energy_aware_defer result).
+    """
+    hit_latencies: list[float] = []
+    miss_latencies: list[float] = []
+    recomputed = 0.0
+    for d in result.decisions:
+        tier = "hbm" if d.hit else "cxl"
+        latency = cost_model.cost(d.site_idx, d.expert_id, tier).latency_ns
+        recomputed += latency + d.wait_ns
+        (hit_latencies if d.hit else miss_latencies).append(latency)
+
+    mean_hit = sum(hit_latencies) / len(hit_latencies) if hit_latencies else 0.0
+    mean_miss = sum(miss_latencies) / len(miss_latencies) if miss_latencies else 0.0
+    return LatencyBreakdown(
+        n_hits=len(hit_latencies),
+        n_misses=len(miss_latencies),
+        mean_hit_latency_ns=mean_hit,
+        mean_miss_latency_ns=mean_miss,
+        reported_total_latency_ns=result.total_latency_ns,
+        recomputed_total_latency_ns=recomputed,
+    )
+
+
 @dataclass
 class _Entry:
     refetch_cost_pj: float

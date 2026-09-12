@@ -54,18 +54,24 @@ def main() -> int:
                     "throughput_tokens_per_sec": 100.0, "avg_latency_ns_per_token": 10.0,
                     "avg_latency_ms_per_token": 10.0 * 1e-6,
                     "total_energy_mj": 1.0, "hit_rate": 1.0, "n_tokens": 50, "n_dispatches": 400,
+                    "n_hits": 400, "n_misses": 0, "mean_miss_latency_ns": 0.0,
+                    "latency_accounting_consistent": True,
                     "latency_plausible": True, "latency_warning": None,
                 },
                 "hbm_cxl_naive": {
                     "throughput_tokens_per_sec": 10.0, "avg_latency_ns_per_token": 100.0,
                     "avg_latency_ms_per_token": 100.0 * 1e-6,
                     "total_energy_mj": 5.0, "hit_rate": 0.3, "n_tokens": 50, "n_dispatches": 400,
+                    "n_hits": 120, "n_misses": 280, "mean_miss_latency_ns": 130.0,
+                    "latency_accounting_consistent": True,
                     "latency_plausible": True, "latency_warning": None,
                 },
                 "hbm_cxl_energy_aware": {
                     "throughput_tokens_per_sec": 12.0, "avg_latency_ns_per_token": 83.0,
                     "avg_latency_ms_per_token": 83.0 * 1e-6,
                     "total_energy_mj": 4.5, "hit_rate": 0.35, "n_tokens": 50, "n_dispatches": 400,
+                    "n_hits": 140, "n_misses": 260, "mean_miss_latency_ns": 115.0,
+                    "latency_accounting_consistent": True,
                     "latency_plausible": True, "latency_warning": None,
                 },
             },
@@ -131,6 +137,10 @@ def main() -> int:
               list(df["avg_latency_ms_per_token"]) == [10.0 * 1e-6, 100.0 * 1e-6, 83.0 * 1e-6]
               and list(df["latency_plausible"]) == [True, True, True],
               f"got {df[['avg_latency_ms_per_token', 'latency_plausible']]}")
+        check("load_comparison surfaces the hit/miss latency-breakdown columns",
+              list(df["n_hits"]) == [400, 120, 140] and list(df["n_misses"]) == [0, 280, 260]
+              and list(df["latency_accounting_consistent"]) == [True, True, True],
+              f"got {df[['n_hits', 'n_misses', 'latency_accounting_consistent']]}")
 
         print("\n[list_stage1_runs]")
         data_runs_dir = root / "data_runs"
@@ -168,29 +178,54 @@ def main() -> int:
               raised_missing)
 
         print("\n[build_expert_skew_summary]")
-        # Deliberately skewed: expert 0 gets 90 dispatches (across 2 layers),
-        # experts 1-3 get 10 combined -- summed across layers per expert.
+        # Deliberately skewed WITHIN each layer: layer 0 dumps almost
+        # everything on expert 0, layer 1 on expert 2 -- each layer is
+        # genuinely, strongly skewed on its own.
         skew_hot_cold = pd.DataFrame({
             "layer_idx":       [0, 0, 0, 0, 1, 1, 1, 1],
             "expert_id":       [0, 1, 2, 3, 0, 1, 2, 3],
-            "dispatch_count":  [50, 2, 2, 1, 40, 2, 2, 1],
+            "dispatch_count":  [50, 2, 2, 1, 1, 2, 50, 2],
         })
         skew_path = root / "hot_cold_skew.csv"
         skew_hot_cold.to_csv(skew_path, index=False)
         skew = build_expert_skew_summary(skew_path)
-        total = 50 + 2 + 2 + 1 + 40 + 2 + 2 + 1
-        check("skew summary's per-expert totals sum across layers (expert 0 = 50+40)",
-              skew["top"][0]["expert_id"] == 0 and skew["top"][0]["dispatch_count"] == 90,
+        total = 50 + 2 + 2 + 1 + 1 + 2 + 50 + 2
+        check("skew summary's top bin is the single highest (layer, expert) row, not a cross-layer sum",
+              skew["top"][0]["dispatch_count"] == 50 and skew["top"][0]["layer_idx"] in (0, 1),
               f"got {skew['top'][0]}")
-        check("skew summary's top-share is an independent recompute (90 / grand total)",
-              abs(skew["top"][0]["share"] - 90 / total) < 1e-9, f"got {skew['top'][0]['share']}")
-        check("gini is in [0, 1] for a genuinely skewed distribution, and clearly non-uniform",
-              0.0 < skew["gini"] <= 1.0, f"got {skew['gini']}")
-        check("max_mean_ratio is an independent recompute (max count / mean count)",
-              abs(skew["max_mean_ratio"] - 90 / ((90 + 4 + 4 + 2) / 4)) < 1e-9,
+        check("skew summary's top-share is an independent recompute (50 / grand total)",
+              abs(skew["top"][0]["share"] - 50 / total) < 1e-9, f"got {skew['top'][0]['share']}")
+        check("gini reflects genuine per-layer skew (computed per (layer,expert) bin, like "
+              "profiler.classify.gini_overall -- NOT summed across layers first)",
+              skew["gini"] > 0.3, f"got {skew['gini']}")
+        check("max_mean_ratio is an independent recompute over the (layer,expert) bins "
+              "(max count / mean count, 8 bins total)",
+              abs(skew["max_mean_ratio"] - 50 / (total / 8)) < 1e-9,
               f"got {skew['max_mean_ratio']}")
-        check("top and bottom both come back non-empty for a 4-expert file",
+        check("top and bottom both come back non-empty",
               len(skew["top"]) > 0 and len(skew["bottom"]) > 0)
+
+        print("\n[build_expert_skew_summary: cross-layer washout regression]")
+        # THE BUG this regression test exists for: an earlier version of
+        # build_expert_skew_summary summed dispatch_count by expert_id
+        # BEFORE measuring skew. Two layers, each individually as skewed as
+        # possible (one expert takes literally everything), but favouring a
+        # DIFFERENT expert each -- summing by expert_id first makes this look
+        # perfectly uniform (50/50 per expert across the 2 layers) even
+        # though every real dispatch was maximally concentrated. Skew must be
+        # measured per (layer, expert) bin, never collapsed across layers
+        # first, or a genuinely skewed run can silently read as uniform.
+        washout_hot_cold = pd.DataFrame({
+            "layer_idx":      [0, 0, 1, 1],
+            "expert_id":      [0, 1, 0, 1],
+            "dispatch_count": [50, 0, 0, 50],
+        })
+        washout_path = root / "hot_cold_washout.csv"
+        washout_hot_cold.to_csv(washout_path, index=False)
+        washout_skew = build_expert_skew_summary(washout_path)
+        check("a per-layer-maximally-skewed run is NOT reported as uniform, even when each "
+              "expert's cross-layer total is identical (the exact washout this test catches)",
+              washout_skew["gini"] >= 0.5, f"got {washout_skew['gini']}")
 
         print("\n[build_expert_skew_summary: uniform distribution]")
         uniform_hot_cold = pd.DataFrame({

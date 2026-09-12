@@ -245,7 +245,24 @@ Be upfront about this wherever these numbers are quoted:
   batching of concurrent cold-expert requests. Real hardware would overlap
   much of this, so throughput/latency figures here are directional (policy A
   vs policy B on the *same* simplified timeline), not an absolute
-  performance prediction.
+  performance prediction. This is the actual cause of the Mixtral decode
+  trace's large (~6.8 s/token) `hbm_cxl_naive` latency figure — see
+  `latency_breakdown` immediately below for how to tell this apart from a
+  units bug rather than assuming which one it is.
+
+### Is a large latency figure a units bug, or this model?
+
+`latency_breakdown(result, cost_model)` (`scheduler/simulate.py`) answers
+this directly instead of leaving "check units" as a manual step: it
+independently recomputes total latency from each decision's own tier cost — a
+separate summation than `_run()`'s own running clock — and reports
+`n_hits`, `n_misses`, `mean_hit_latency_ns`, `mean_miss_latency_ns`, and
+whether the reported and recomputed totals agree
+(`accounting_consistent`, within 0.01%). `experiments/harness.py`'s
+`ConfigResult.from_simulation` calls this automatically whenever
+`LATENCY_SANITY_CEILING_MS` fires, and states which of the two explanations
+applies, with the actual numbers, rather than a generic warning — see
+`experiments/README.md`'s "Latency sanity ceiling."
 - **Batching not implemented.** docs.md 4.5 frames the scheduler's options as
   "fetch now / defer / batch." This version implements fetch-now, defer, and
   (new) energy-aware eviction — not batching. Batching was deliberately left

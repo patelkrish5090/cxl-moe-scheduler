@@ -188,11 +188,30 @@ locality comparison for both groups. Use `--layers`:
 | `diverse` | only layers with a working set larger than `top_k` |
 | `trivial` | only the cache-trivial layers |
 
-Mixtral-8x7B-v0.1 is the motivating case: layers 1–15 route every token to
-experts 0 and 1 in both prefill and decode. `scripts/inspect_routers.py
-models/mixtral --load` confirmed this is genuine — the routers load with zero
-missing keys and non-degenerate weights — so those layers are cache-trivial by
-nature and the diverse-layer table is the one to quote.
+**Correction (superseded claim):** an earlier version of this section claimed
+Mixtral-8x7B-v0.1 layers 1–15 "route every token to experts 0 and 1" in both
+prefill and decode, and cited `scripts/inspect_routers.py models/mixtral
+--load` as confirmation. That check only inspects the router's weight
+tensors (it never runs a forward pass), so it could not actually have
+confirmed a *routing* behaviour. The real, clean runs (after fixing the
+`device_map="auto"` NaN-corruption bug documented in this project's stage-1
+history — sharding Mixtral across 2 GPUs silently poisoned router logits with
+NaN, and `torch.topk` does not raise on NaN, it deterministically biases
+toward low indices, which looks exactly like "always picks experts 0, 1")
+show only mild skew: Gini 0.069–0.115 across the prefill/decode Mixtral runs,
+not the near-total collapse the original claim described. Mixtral is NOT
+cache-trivial in the way this section previously implied.
+
+Mild-but-real skew (clearly nonzero Gini, not the near-total collapse above)
+is itself consistent with Mixtral's own published routing analysis
+(Jiang et al. 2024, "Mixtral of Experts," arXiv:2401.04088, sec. 5 "Routing
+analysis," Figure 7): the paper reports per-expert selection proportions
+close to the 1/8 uniform-sampling reference line across domains, a direct
+consequence of the auxiliary load-balancing loss used during training. A
+flat-zero Gini would still mean the hooking is wrong (docs.md 6 checkpoint
+1's actual warning sign), but a modest, nonzero Gini for a model trained this
+way is the expected result, not a symptom of a broken profiler -- see
+docs.md 6's checkpoint 1 note for the project-level implication.
 
 Two flags interact with this:
 

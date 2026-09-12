@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from scheduler.model import CostModel, TierFigures
 from scheduler.simulate import Decision, SimulationResult
 
 from .harness import LATENCY_SANITY_CEILING_MS, ComparisonResult, ConfigResult, run_comparison
@@ -33,6 +34,8 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 def _fake_result(latencies_ns: list[float], energies_pj: list[float]) -> SimulationResult:
     """A SimulationResult with hand-chosen per-dispatch latency/energy, sim_time
     accumulated exactly like scheduler.simulate._run does (running total).
+    Every decision is a miss (hit=False) -- see _cost_model's docstring for
+    why that matters when pairing this with a CostModel for latency_breakdown.
     """
     result = SimulationResult(policy="naive")
     running = 0.0
@@ -45,12 +48,32 @@ def _fake_result(latencies_ns: list[float], energies_pj: list[float]) -> Simulat
     return result
 
 
+def _cost_model(cxl_latency_ns: float = 100.0, hbm_latency_ns: float = 10.0) -> CostModel:
+    """A CostModel whose cost(0, 0, tier).latency_ns is EXACTLY the given
+    constant, for testing scheduler.simulate.latency_breakdown against
+    _fake_result's hand-chosen sim_time values without a real tier_model.json
+    or hot_cold.csv. weight_bytes=0 makes the bandwidth-limited transfer term
+    exactly 0, so cost.latency_ns reduces to the tier's own latency_ns with no
+    rounding to worry about.
+    """
+    tiers = {
+        "hbm": TierFigures("hbm", latency_ns=hbm_latency_ns, peak_bandwidth_gbps=1.0,
+                            device_energy_pj_per_bit=1.0, link_energy_pj_per_bit=0.0,
+                            total_energy_pj_per_bit=1.0),
+        "cxl": TierFigures("cxl", latency_ns=cxl_latency_ns, peak_bandwidth_gbps=1.0,
+                            device_energy_pj_per_bit=1.0, link_energy_pj_per_bit=1.0,
+                            total_energy_pj_per_bit=2.0),
+    }
+    return CostModel({0: 0}, tiers)
+
+
 def main() -> int:
     print("\n[ConfigResult: independent recompute]")
     # 4 dispatches, 1 dispatch per token (4 tokens), hand-chosen latencies and
     # energies so throughput/avg-latency/energy can be recomputed by hand.
     sim = _fake_result(latencies_ns=[100.0, 200.0, 300.0, 400.0], energies_pj=[10.0, 20.0, 30.0, 40.0])
-    cfg = ConfigResult.from_simulation("test-config", sim, n_tokens=4)
+    cfg = ConfigResult.from_simulation("test-config", sim, n_tokens=4, cost_model=_cost_model())
+    check("n_hits/n_misses match the all-miss fixture", cfg.n_hits == 0 and cfg.n_misses == 4)
 
     check("total_latency_ns is the running sum of per-dispatch latencies",
           cfg.total_latency_ns == 1000.0, f"got {cfg.total_latency_ns}")
@@ -70,22 +93,46 @@ def main() -> int:
     check("a small, plausible latency is not flagged", cfg.latency_plausible and cfg.latency_warning is None)
 
     print("\n[ConfigResult: latency sanity ceiling]")
-    # One dispatch with a latency well past LATENCY_SANITY_CEILING_MS.
-    slow_sim = _fake_result(latencies_ns=[LATENCY_SANITY_CEILING_MS * 1e6 * 10], energies_pj=[1.0])
-    slow_cfg = ConfigResult.from_simulation("slow", slow_sim, n_tokens=1)
+    # One dispatch with a latency well past LATENCY_SANITY_CEILING_MS, paired
+    # with a cost_model whose own recompute agrees with it exactly (built via
+    # _cost_model with the SAME constant) -- this is the "real modelling
+    # consequence, not a units bug" branch.
+    huge_latency_ns = LATENCY_SANITY_CEILING_MS * 1e6 * 10
+    slow_sim = _fake_result(latencies_ns=[huge_latency_ns], energies_pj=[1.0])
+    slow_cfg = ConfigResult.from_simulation(
+        "slow", slow_sim, n_tokens=1, cost_model=_cost_model(cxl_latency_ns=huge_latency_ns)
+    )
     check("a latency far past the sanity ceiling is flagged implausible",
           not slow_cfg.latency_plausible, f"avg_ms={slow_cfg.avg_latency_ms_per_token}")
     check("an implausible latency carries a non-None warning naming the ceiling",
           slow_cfg.latency_warning is not None and "sanity ceiling" in slow_cfg.latency_warning)
+    check("when the independent recompute agrees, latency_accounting_consistent is True",
+          slow_cfg.latency_accounting_consistent)
+    check("when accounting is consistent, the warning states the determined cause is the "
+          "no-overlap model, explicitly ruling out a units bug",
+          "NOT a units bug" in slow_cfg.latency_warning, slow_cfg.latency_warning)
+
+    # Same huge reported latency, but now the cost_model's independent
+    # recompute deliberately disagrees (half the fabricated value) -- this is
+    # the "this IS a units/accounting bug" branch.
+    bug_cfg = ConfigResult.from_simulation(
+        "bug", slow_sim, n_tokens=1, cost_model=_cost_model(cxl_latency_ns=huge_latency_ns / 2)
+    )
+    check("a genuine reported-vs-recomputed mismatch is caught (latency_accounting_consistent False)",
+          not bug_cfg.latency_accounting_consistent)
+    check("when accounting disagrees, the warning names it as a units/accounting bug, not a model artifact",
+          bug_cfg.latency_warning is not None and "IS a units/accounting bug" in bug_cfg.latency_warning,
+          bug_cfg.latency_warning)
+
     check("a latency exactly at the ceiling is still plausible (boundary is exclusive)",
           ConfigResult.from_simulation(
               "boundary", _fake_result(latencies_ns=[LATENCY_SANITY_CEILING_MS * 1e6], energies_pj=[1.0]),
-              n_tokens=1,
+              n_tokens=1, cost_model=_cost_model(cxl_latency_ns=LATENCY_SANITY_CEILING_MS * 1e6),
           ).latency_plausible)
 
     print("\n[ConfigResult: degenerate cases]")
     empty = SimulationResult(policy="naive")
-    empty_cfg = ConfigResult.from_simulation("empty", empty, n_tokens=0)
+    empty_cfg = ConfigResult.from_simulation("empty", empty, n_tokens=0, cost_model=_cost_model())
     check("zero tokens gives NaN throughput/latency, not a ZeroDivisionError",
           math.isnan(empty_cfg.throughput_tokens_per_sec) and math.isnan(empty_cfg.avg_latency_ns_per_token))
     check("zero tokens gives zero energy, not NaN (no decisions were made)",
@@ -147,6 +194,17 @@ def main() -> int:
         check("all three configs saw the same 20 tokens",
               comparison.hbm_only.n_tokens == comparison.hbm_cxl_naive.n_tokens ==
               comparison.hbm_cxl_energy_aware.n_tokens == 20)
+        check("every config's latency accounting is internally consistent end-to-end "
+              "(the independent recompute genuinely agrees, not just by construction)",
+              comparison.hbm_only.latency_accounting_consistent
+              and comparison.hbm_cxl_naive.latency_accounting_consistent
+              and comparison.hbm_cxl_energy_aware.latency_accounting_consistent)
+        check("hbm_only has zero misses (n_hits == n_dispatches, n_misses == 0)",
+              comparison.hbm_only.n_misses == 0
+              and comparison.hbm_only.n_hits == comparison.hbm_only.n_dispatches)
+        check("hbm_cxl_naive's n_hits + n_misses equals its own n_dispatches",
+              comparison.hbm_cxl_naive.n_hits + comparison.hbm_cxl_naive.n_misses
+              == comparison.hbm_cxl_naive.n_dispatches)
 
         print("\n[ComparisonResult: checkpoint-3 gap and eviction divergence wiring]")
         expected_gap = 100.0 * (

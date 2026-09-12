@@ -133,6 +133,7 @@ else:
     display_df = df[[
         "label", "throughput_tokens_per_sec", "avg_latency_ns_per_token",
         "avg_latency_ms_per_token", "total_energy_mj", "hit_rate", "n_tokens", "n_dispatches",
+        "n_hits", "n_misses", "mean_miss_latency_ns",
     ]].rename(columns={
         "label": "config",
         "throughput_tokens_per_sec": "throughput (tok/s)",
@@ -140,13 +141,29 @@ else:
         "avg_latency_ms_per_token": "avg latency (ms/tok)",
         "total_energy_mj": "total energy (mJ)",
         "hit_rate": "hit rate",
+        "mean_miss_latency_ns": "mean cold-fetch latency (ns)",
     })
     st.dataframe(display_df, width='stretch', hide_index=True)
+
+    # A latency_accounting_consistent == False would mean the independently-
+    # recomputed total latency (scheduler.simulate.latency_breakdown)
+    # disagrees with the reported one -- a genuine units/accounting bug, not
+    # a modelling artifact. This should never fire; if it does, trust it over
+    # every other number on this page.
+    inconsistent = df[~df["latency_accounting_consistent"]]
+    if not inconsistent.empty:
+        st.error(
+            "**Latency accounting bug detected** for: " + ", ".join(inconsistent["label"]) +
+            ". The independently-recomputed total latency (scheduler.simulate.latency_breakdown) "
+            "disagrees with the reported total -- do not trust any latency/throughput number on "
+            "this page until this is fixed."
+        )
 
     # Per-config latency sanity-check warnings (experiments/harness.py's
     # LATENCY_SANITY_CEILING_MS) -- surfaced here, not silently dropped, even
     # though a real run on this project's own trace legitimately triggers it
-    # (see that constant's docstring for the walked-back explanation).
+    # (see that constant's docstring for the walked-back explanation). The
+    # warning text itself already states which of the two causes applies.
     for _, row in df.iterrows():
         if not row["latency_plausible"]:
             st.warning(f"**{row['label']}**: {row['latency_warning']}")
@@ -251,17 +268,18 @@ else:
     s_col1, s_col2 = st.columns(2)
     s_col1.metric(
         "Gini coefficient", f"{skew['gini']:.3f}",
-        help="0 = perfectly uniform routing across experts, 1 = all traffic to one expert.",
+        help="Computed per (layer, expert) bin -- the same granularity as the heatmap above, "
+             "not summed across layers first. 0 = perfectly uniform routing, 1 = one bin takes everything.",
     )
     s_col2.metric(
         "Max/mean dispatch ratio", f"{skew['max_mean_ratio']:.2f}x",
-        help="The busiest expert's total dispatch count, divided by the average across all experts.",
+        help="The busiest single (layer, expert) bin's dispatch count, divided by the average bin.",
     )
 
     top_col, bottom_col = st.columns(2)
     with top_col:
-        st.markdown(f"**Top {len(skew['top'])} experts by share**")
+        st.markdown(f"**Top {len(skew['top'])} (layer, expert) bins by share**")
         st.dataframe(pd.DataFrame(skew["top"]), width='stretch', hide_index=True)
     with bottom_col:
-        st.markdown(f"**Bottom {len(skew['bottom'])} experts by share**")
+        st.markdown(f"**Bottom {len(skew['bottom'])} (layer, expert) bins by share**")
         st.dataframe(pd.DataFrame(skew["bottom"]), width='stretch', hide_index=True)

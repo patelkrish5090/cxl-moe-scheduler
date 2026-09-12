@@ -30,6 +30,7 @@ from .simulate import (
     _SiteCache,
     diff_decisions,
     eviction_divergence_report,
+    latency_breakdown,
     run_energy_aware_defer,
     run_energy_aware_evict,
     run_hbm_only,
@@ -189,6 +190,49 @@ def main() -> int:
     check("hbm-only: strictly cheaper than naive on the same trace (never pays cxl link/device energy)",
           hbm_only_result.total_energy_pj < result_hit.total_energy_pj,
           f"hbm_only={hbm_only_result.total_energy_pj}, naive={result_hit.total_energy_pj}")
+
+    print("\n[latency_breakdown]")
+    # `result` is all-misses (3/3), `result_hit` is one miss then one hit --
+    # both hand-traceable against the same hbm_cost/cxl_cost figures already
+    # independently checked above.
+    all_miss_breakdown = latency_breakdown(result, cm)
+    check("all-miss run: n_hits/n_misses match the decisions exactly",
+          all_miss_breakdown.n_hits == 0 and all_miss_breakdown.n_misses == 3,
+          f"got hits={all_miss_breakdown.n_hits}, misses={all_miss_breakdown.n_misses}")
+    check("all-miss run: mean_miss_latency_ns matches the independently-computed cxl cost",
+          math.isclose(all_miss_breakdown.mean_miss_latency_ns, cxl_cost.latency_ns),
+          f"got {all_miss_breakdown.mean_miss_latency_ns}, expected {cxl_cost.latency_ns}")
+    check("all-miss run: recomputed total matches SimulationResult's own accumulator "
+          "(the direct check that total_latency_ns is not a double-count/drop bug)",
+          all_miss_breakdown.accounting_consistent,
+          f"reported={all_miss_breakdown.reported_total_latency_ns}, "
+          f"recomputed={all_miss_breakdown.recomputed_total_latency_ns}")
+
+    hit_breakdown = latency_breakdown(result_hit, cm)
+    check("hit run: one hit, one miss",
+          hit_breakdown.n_hits == 1 and hit_breakdown.n_misses == 1,
+          f"got hits={hit_breakdown.n_hits}, misses={hit_breakdown.n_misses}")
+    check("hit run: mean_hit_latency_ns matches the independently-computed hbm cost",
+          math.isclose(hit_breakdown.mean_hit_latency_ns, hbm_cost.latency_ns),
+          f"got {hit_breakdown.mean_hit_latency_ns}, expected {hbm_cost.latency_ns}")
+    check("hit run: recomputed total matches SimulationResult's own accumulator",
+          hit_breakdown.accounting_consistent,
+          f"reported={hit_breakdown.reported_total_latency_ns}, "
+          f"recomputed={hit_breakdown.recomputed_total_latency_ns}")
+
+    # A deliberately WRONG "reported" total (as if _run() had double-counted
+    # one dispatch) must be caught -- accounting_consistent is not vacuously
+    # true.
+    from .simulate import LatencyBreakdown as _LB
+    broken = _LB(
+        n_hits=hit_breakdown.n_hits, n_misses=hit_breakdown.n_misses,
+        mean_hit_latency_ns=hit_breakdown.mean_hit_latency_ns,
+        mean_miss_latency_ns=hit_breakdown.mean_miss_latency_ns,
+        reported_total_latency_ns=hit_breakdown.recomputed_total_latency_ns * 2,
+        recomputed_total_latency_ns=hit_breakdown.recomputed_total_latency_ns,
+    )
+    check("a genuinely mismatched total is correctly flagged as inconsistent",
+          not broken.accounting_consistent)
 
     print("\n[energy-aware-defer policy]")
     # Budget large enough to never defer: should match naive exactly, dispatch

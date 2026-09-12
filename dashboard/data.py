@@ -76,6 +76,10 @@ def load_comparison(path: str | Path) -> pd.DataFrame:
             "hit_rate": cfg["hit_rate"],
             "n_tokens": cfg["n_tokens"],
             "n_dispatches": cfg["n_dispatches"],
+            "n_hits": cfg["n_hits"],
+            "n_misses": cfg["n_misses"],
+            "mean_miss_latency_ns": cfg["mean_miss_latency_ns"],
+            "latency_accounting_consistent": cfg["latency_accounting_consistent"],
             "latency_plausible": cfg["latency_plausible"],
             "latency_warning": cfg["latency_warning"],
         })
@@ -110,17 +114,34 @@ def build_heatmap_grid(hot_cold_csv: str | Path) -> pd.DataFrame:
 def build_expert_skew_summary(hot_cold_csv: str | Path, top_n: int = 5) -> dict:
     """Numeric summary of how skewed expert usage actually is, for the
     selected stage-1 run -- the heatmap alone reads as fairly flat by eye at
-    Mixtral's scale (32 experts x many layers), so this gives the same
-    checkpoint a number: total dispatch share per expert (summed across all
-    layers), overall Gini coefficient (profiler.classify.gini -- 0 = uniform,
-    1 = one expert takes everything), and max/mean ratio (a second, more
-    literal skew measure that doesn't require knowing how to read a Gini
-    coefficient).
+    Mixtral's scale (32 layers x 8 experts), so this gives the same
+    checkpoint a number.
+
+    Computed over the SAME bins as profiler.classify's own
+    ``gini_overall`` -- one independent count per (layer_idx, expert_id)
+    pair, exactly as hot_cold.csv already stores one row per pair. This is
+    NOT the same as summing dispatch_count by expert_id first and measuring
+    skew across that: an earlier version of this function did exactly that,
+    and it is a real bug, not a stylistic choice -- Mixtral routes each
+    layer somewhat independently (per its own published routing analysis,
+    arXiv:2401.04088 sec. 5), so two layers that each favour a *different*
+    expert average out toward uniform once collapsed into 8 per-expert
+    totals, even though every individual layer is genuinely skewed. Collapsing
+    away the layer axis before measuring skew silently erases the exact
+    signal this checkpoint exists to catch (caught when this function's
+    result, ~0.03 Gini, contradicted profiler.classify's own gini_overall for
+    the same run, ~0.115 -- see dashboard/selftest.py's regression test for a
+    constructed example that reproduces this directly).
+
+    Gini (profiler.classify.gini -- 0 = uniform, 1 = one bin takes
+    everything) and max/mean ratio (a second, more literal skew measure) are
+    both reported, since neither alone is self-explanatory.
 
     Returns:
         {"gini": float, "max_mean_ratio": float, "top": [...], "bottom": [...]}
-        where "top"/"bottom" are the `top_n` experts by total dispatch share,
-        each {"expert_id": int, "dispatch_count": int, "share": float}.
+        where "top"/"bottom" are the `top_n` (layer, expert) bins by share of
+        all dispatches in this run, each {"layer_idx": int, "expert_id": int,
+        "dispatch_count": int, "share": float}.
 
     Raises:
         FileNotFoundError: if hot_cold_csv does not exist.
@@ -129,23 +150,28 @@ def build_expert_skew_summary(hot_cold_csv: str | Path, top_n: int = 5) -> dict:
     if not hot_cold_csv.is_file():
         raise FileNotFoundError(f"no hot_cold.csv at {hot_cold_csv}")
     table = pd.read_csv(hot_cold_csv)
-    by_expert = table.groupby("expert_id")["dispatch_count"].sum().sort_values(ascending=False)
-    total = float(by_expert.sum())
-    shares = (by_expert / total) if total > 0 else by_expert.astype(float) * 0.0
 
-    counts = by_expert.to_numpy(dtype=float)
+    counts = table["dispatch_count"].to_numpy(dtype=float)
+    total = float(counts.sum())
     mean = float(counts.mean()) if counts.size else 0.0
     max_mean_ratio = (float(counts.max()) / mean) if mean > 0 else math.nan
 
-    def _rows(series: pd.Series) -> list[dict]:
+    ranked = table.sort_values("dispatch_count", ascending=False)
+
+    def _rows(sub: pd.DataFrame) -> list[dict]:
         return [
-            {"expert_id": int(expert_id), "dispatch_count": int(by_expert[expert_id]), "share": float(share)}
-            for expert_id, share in series.items()
+            {
+                "layer_idx": int(row.layer_idx),
+                "expert_id": int(row.expert_id),
+                "dispatch_count": int(row.dispatch_count),
+                "share": float(row.dispatch_count / total) if total > 0 else 0.0,
+            }
+            for row in sub.itertuples()
         ]
 
     return {
         "gini": gini(counts),
         "max_mean_ratio": max_mean_ratio,
-        "top": _rows(shares.head(top_n)),
-        "bottom": _rows(shares.tail(top_n)),
+        "top": _rows(ranked.head(top_n)),
+        "bottom": _rows(ranked.tail(top_n)),
     }

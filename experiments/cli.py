@@ -27,6 +27,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     for cfg in (comparison.hbm_only, comparison.hbm_cxl_naive, comparison.hbm_cxl_energy_aware):
         print(f"{cfg.config:<24}{cfg.throughput_tokens_per_sec:>18.6g}"
               f"{cfg.avg_latency_ms_per_token:>18.6g}{cfg.total_energy_mj:>16.6g}")
+        if not cfg.latency_accounting_consistent:
+            print(f"  ERROR: latency accounting is INCONSISTENT for {cfg.config} -- the "
+                  "independently-recomputed total latency disagrees with the reported total. "
+                  "See scheduler.simulate.latency_breakdown; do not trust this config's latency "
+                  "or throughput numbers until this is fixed.")
         if not cfg.latency_plausible:
             print(f"  WARNING: {cfg.latency_warning}")
 
