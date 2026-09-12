@@ -247,22 +247,8 @@ Be upfront about this wherever these numbers are quoted:
   vs policy B on the *same* simplified timeline), not an absolute
   performance prediction. This is the actual cause of the Mixtral decode
   trace's large (~6.8 s/token) `hbm_cxl_naive` latency figure — see
-  `latency_breakdown` immediately below for how to tell this apart from a
-  units bug rather than assuming which one it is.
-
-### Is a large latency figure a units bug, or this model?
-
-`latency_breakdown(result, cost_model)` (`scheduler/simulate.py`) answers
-this directly instead of leaving "check units" as a manual step: it
-independently recomputes total latency from each decision's own tier cost — a
-separate summation than `_run()`'s own running clock — and reports
-`n_hits`, `n_misses`, `mean_hit_latency_ns`, `mean_miss_latency_ns`, and
-whether the reported and recomputed totals agree
-(`accounting_consistent`, within 0.01%). `experiments/harness.py`'s
-`ConfigResult.from_simulation` calls this automatically whenever
-`LATENCY_SANITY_CEILING_MS` fires, and states which of the two explanations
-applies, with the actual numbers, rather than a generic warning — see
-`experiments/README.md`'s "Latency sanity ceiling."
+  "Is a large latency figure a units bug, or this model?" below for how to
+  tell this apart from a units bug rather than assuming which one it is.
 - **Batching not implemented.** docs.md 4.5 frames the scheduler's options as
   "fetch now / defer / batch." This version implements fetch-now, defer, and
   (new) energy-aware eviction — not batching. Batching was deliberately left
@@ -274,6 +260,56 @@ applies, with the actual numbers, rather than a generic warning — see
   figure already cited), since that is exactly the kind of cost batching is
   meant to amortize. This reasoning is unchanged from the deferral-only
   version of this stage.
+
+### Is a large latency figure a units bug, or this model?
+
+`latency_breakdown(result, cost_model)` (`scheduler/simulate.py`) answers
+the accounting half of this directly instead of leaving "check units" as a
+manual step: it independently recomputes total latency from each decision's
+own tier cost — a separate summation than `_run()`'s own running clock — and
+reports `n_hits`, `n_misses`, `mean_hit_latency_ns`, `mean_miss_latency_ns`,
+and whether the reported and recomputed totals agree
+(`accounting_consistent`, within 0.01%). `experiments/harness.py`'s
+`ConfigResult.from_simulation` calls this automatically whenever
+`LATENCY_SANITY_CEILING_MS` fires and quotes the EXACT decomposition
+(`n_hits x mean_hit_latency_ns + n_misses x mean_miss_latency_ns`, divided
+by `n_tokens`) that reproduces the reported figure — not an approximation
+that drops the hit-latency term (a hit still pays an HBM read for the
+expert's weights in this model, it is not free; an earlier version of this
+warning dropped that term and was off by ~5% on the real Mixtral trace as a
+result — see `experiments/selftest.py`'s "mixed hit/miss fixture" check).
+This resolves "is the ACCOUNTING right" conclusively: on the real
+`mixtral_8x7b_decode` trace, it is.
+
+**Still open, and NOT yet resolved by the accounting check above**: whether
+`mean_miss_latency_ns`'s own magnitude (~149 ms, implying an effective
+~2.3 GB/s cold-fetch bandwidth) is a *deliberate* consequence of this
+project's fully-serial, no-pipelining fetch model, or a DRAMSim3/gem5 sweep
+config issue (real CXL links are commonly specified in the tens of GB/s).
+What's confirmed from the code so far:
+
+- `memsim/run_sweep.py`'s `DEVICE_PREFERENCE` explicitly models the CXL
+  tier's memory as commodity DDR5/DDR4/DDR3 DRAM behind the link (not the
+  same HBM2 device class used for the `hbm` tier) — "the CXL tier is
+  commodity DRAM behind the link" is the comment in that dict. This IS a
+  deliberate, documented architectural choice: the number is not meant to
+  represent the CXL *link's* own theoretical max bandwidth, but the
+  achievable bandwidth of whatever DRAM sits behind it.
+- What is NOT yet confirmed: whether ~2.36 GB/s is a plausible *achieved*
+  fraction of that specific DDR device's real capability under this
+  project's traffic-generator access pattern (`tier.py`'s fixed-rate,
+  64-byte-block `PyTrafficGen`), or whether an unintentionally narrow/slow
+  device `.ini` was picked. That requires the actual `memsim/tier_model.json`
+  figures, the real sweep-point table (`python -m memsim.cli compare`'s
+  "[1] SWEEP POINTS" section — does bandwidth plateau as injection period
+  shrinks, or does it look generator-limited even at the slowest points?),
+  and the specific DRAMSim3 `.ini` file matched for the `cxl` tier (its
+  channel count / bus width sets its real theoretical ceiling) — none of
+  which are available from static code reading alone.
+
+Until that's checked against the real config, treat `mean_miss_latency_ns`
+as internally consistent (the accounting is right) but NOT yet confirmed
+plausible in absolute terms.
 
 ## Validation checkpoints
 

@@ -95,6 +95,7 @@ class ConfigResult:
     throughput_tokens_per_sec: float
     n_hits: int
     n_misses: int
+    mean_hit_latency_ns: float
     mean_miss_latency_ns: float
     latency_accounting_consistent: bool
     latency_plausible: bool
@@ -127,21 +128,36 @@ class ConfigResult:
                     "accounting bug, not a modelling artifact. See scheduler.simulate.latency_breakdown."
                 )
             else:
-                dispatches_per_token = result.n_dispatches / n_tokens if n_tokens else math.nan
+                # The EXACT two-term decomposition, not an approximation that
+                # drops the hit-latency term: n_hits and n_misses are exact
+                # integer counts, mean_hit/miss_latency_ns are the exact
+                # per-dispatch constants latency_breakdown derived (every hit
+                # in this model still pays an HBM read for the expert's
+                # weights, so it is NOT free -- omitting it here previously
+                # produced a warning whose own quoted arithmetic did not
+                # reproduce the reported figure; see experiments/selftest.py's
+                # "exact decomposition" check for the regression guard).
+                sum_ns = (
+                    breakdown.n_hits * breakdown.mean_hit_latency_ns
+                    + breakdown.n_misses * breakdown.mean_miss_latency_ns
+                )
+                recomputed_avg_ms = sum_ns * _NS_TO_MS / n_tokens if n_tokens else math.nan
                 warning = (
-                    f"avg latency {avg_latency_ms:,.1f} ms/token exceeds the "
+                    f"avg latency {avg_latency_ms:,.4f} ms/token exceeds the "
                     f"{LATENCY_SANITY_CEILING_MS:,.0f} ms/token sanity ceiling. Determined cause: this is "
                     "NOT a units bug -- scheduler.simulate.latency_breakdown's independently-recomputed "
-                    "total agrees with the reported one, ruling out a double-counted/dropped dispatch. It "
-                    "is a real consequence of this simulator's fully-serial, no-overlap timing model "
-                    f"(scheduler/README.md) at this run's own measured figures: {dispatches_per_token:.1f} "
-                    f"dispatches/token, {result.hit_rate:.1%} hit rate, "
-                    f"{breakdown.mean_miss_latency_ns * _NS_TO_MS:,.2f} ms per cold fetch -- "
-                    f"{dispatches_per_token:.1f} x (1 - {result.hit_rate:.3f}) x "
-                    f"{breakdown.mean_miss_latency_ns * _NS_TO_MS:,.2f} ms ~= {avg_latency_ms:,.1f} ms/token. "
-                    "Every cold expert fetch is modelled as fully serial with no overlap across layers, "
-                    "experts, or tokens -- see LATENCY_SANITY_CEILING_MS's docstring in "
-                    "experiments/harness.py."
+                    f"total agrees with the reported one (discrepancy {breakdown.discrepancy_pct:.4f}%), "
+                    "ruling out a double-counted/dropped dispatch. Exact decomposition (n_hits x "
+                    "mean_hit_latency_ns + n_misses x mean_miss_latency_ns, divided by n_tokens): "
+                    f"{breakdown.n_hits:,} hits x {breakdown.mean_hit_latency_ns:,.4f} ns/hit + "
+                    f"{breakdown.n_misses:,} misses x {breakdown.mean_miss_latency_ns:,.4f} ns/miss "
+                    f"= {sum_ns:,.1f} ns total / {n_tokens:,} tokens x 1e-6 = {recomputed_avg_ms:,.4f} "
+                    f"ms/token (reported: {avg_latency_ms:,.4f} ms/token). This assumes every cold "
+                    "expert fetch is fully serial with no overlap across layers, experts, or tokens "
+                    "(scheduler/README.md's 'no overlap / no concurrency' model) -- see "
+                    "scheduler/README.md's latency_breakdown section for whether the underlying tier "
+                    "bandwidth this implies is a deliberate worst-case bound or needs checking against "
+                    "the real memsim config."
                 )
 
         return cls(
@@ -157,6 +173,7 @@ class ConfigResult:
             throughput_tokens_per_sec=throughput,
             n_hits=breakdown.n_hits,
             n_misses=breakdown.n_misses,
+            mean_hit_latency_ns=breakdown.mean_hit_latency_ns,
             mean_miss_latency_ns=breakdown.mean_miss_latency_ns,
             latency_accounting_consistent=breakdown.accounting_consistent,
             latency_plausible=plausible,

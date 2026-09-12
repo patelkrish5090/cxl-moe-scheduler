@@ -69,17 +69,29 @@ compares it to the reported total:
 - If they **agree**, the warning states the determined, non-bug cause: this
   simulator's own documented "no overlap, one dispatch at a time" model
   (`scheduler/README.md`'s "WHAT THIS DOES NOT MODEL") combined with a real,
-  slow measured CXL bandwidth, and shows the actual arithmetic
-  (`dispatches_per_token x (1 - hit_rate) x mean_miss_latency_ms`) that
-  produces the number — not just an assertion that it's fine.
+  slow measured CXL bandwidth, and shows the EXACT decomposition that
+  reproduces the reported figure — not an approximation. An earlier version
+  of this warning approximated total latency as `dispatches_per_token x
+  (1 - hit_rate) x mean_miss_latency_ms`, which silently dropped the
+  hit-latency term entirely (a "hit" in this model still pays an HBM read
+  for the expert's weights — it is not free) and was off by ~5% on the real
+  Mixtral trace as a result. The warning now quotes the exact identity
+  instead: `n_hits x mean_hit_latency_ns + n_misses x mean_miss_latency_ns`,
+  divided by `n_tokens`, which reconciles to the reported
+  `avg_latency_ms_per_token` to the printed decimal place every time (see
+  `experiments/selftest.py`'s "mixed hit/miss fixture" check, built
+  specifically to catch a dropped term like this one).
 
 On the real `mixtral_8x7b_decode` trace, `hbm_cxl_naive`'s ~6.8 s/token
-figure is exactly this second case: accounting is consistent, walked back to
-a real, slow measured CXL bandwidth (2.36 GB/s) times 179,090 sequential
-352 MB expert fetches with zero concurrency. `ConfigResult.n_hits`,
-`n_misses`, and `mean_miss_latency_ns` are always available (not only when
-the ceiling fires) for exactly this kind of manual sanity check — see
-`LATENCY_SANITY_CEILING_MS`'s docstring in `experiments/harness.py`.
+figure is this second case: accounting is consistent, and the exact
+decomposition (`n_hits`, `n_misses`, `mean_hit_latency_ns`,
+`mean_miss_latency_ns` — all always available on `ConfigResult`, not only
+when the ceiling fires) reproduces it exactly. **Still open**: whether the
+~2.36 GB/s effective cold-fetch bandwidth this implies is itself a
+deliberate fully-serial worst-case bound, or reflects a DRAMSim3/gem5 config
+issue — see `scheduler/README.md`'s "Is a large latency figure a units bug,
+or this model?" for what's confirmed and what's still pending real
+gem5/DRAMSim3 config data.
 
 ## Checkpoint 3 gap and eviction divergence
 

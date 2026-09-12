@@ -133,7 +133,7 @@ else:
     display_df = df[[
         "label", "throughput_tokens_per_sec", "avg_latency_ns_per_token",
         "avg_latency_ms_per_token", "total_energy_mj", "hit_rate", "n_tokens", "n_dispatches",
-        "n_hits", "n_misses", "mean_miss_latency_ns",
+        "n_hits", "n_misses", "mean_hit_latency_ns", "mean_miss_latency_ns",
     ]].rename(columns={
         "label": "config",
         "throughput_tokens_per_sec": "throughput (tok/s)",
@@ -141,8 +141,14 @@ else:
         "avg_latency_ms_per_token": "avg latency (ms/tok)",
         "total_energy_mj": "total energy (mJ)",
         "hit_rate": "hit rate",
+        "mean_hit_latency_ns": "mean hit latency (ns)",
         "mean_miss_latency_ns": "mean cold-fetch latency (ns)",
     })
+    st.caption(
+        "avg latency (ms/tok) reconciles exactly as (n_hits x mean hit latency + "
+        "n_misses x mean cold-fetch latency) / n_tokens -- a hit is not free in this "
+        "model, it still pays an HBM read for the expert's weights."
+    )
     st.dataframe(display_df, width='stretch', hide_index=True)
 
     # A latency_accounting_consistent == False would mean the independently-

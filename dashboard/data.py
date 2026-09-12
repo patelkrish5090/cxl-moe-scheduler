@@ -78,6 +78,7 @@ def load_comparison(path: str | Path) -> pd.DataFrame:
             "n_dispatches": cfg["n_dispatches"],
             "n_hits": cfg["n_hits"],
             "n_misses": cfg["n_misses"],
+            "mean_hit_latency_ns": cfg["mean_hit_latency_ns"],
             "mean_miss_latency_ns": cfg["mean_miss_latency_ns"],
             "latency_accounting_consistent": cfg["latency_accounting_consistent"],
             "latency_plausible": cfg["latency_plausible"],
