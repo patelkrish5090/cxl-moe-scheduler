@@ -102,8 +102,42 @@ def find_dramsim_configs(third_party: Path) -> Path:
     )
 
 
+def _parse_speed_mts(path: Path) -> int:
+    """DRAMSim3 config filenames follow ``<TYPE>_<density>Gb_x<width>_<speed>
+    [_<variant>].ini`` for speed-graded device classes (DDR3/DDR4/LPDDR3/
+    LPDDR4). Returns the speed grade in MT/s parsed from the 4th underscore-
+    separated token, or 0 when the filename carries no such token (HBM/HBM2/
+    GDDR* in this DRAMSim3 ship only encode ``<TYPE>_<density>_<width>``, with
+    no speed grade at all; a "_debug" variant such as ``ddr4_debug.ini`` also
+    has no numeric 4th token). 0 sorts last in :func:`pick_device_config`'s
+    speed-first ordering, so a debug config or a device class with no speed
+    variants never wins over a real speed-graded part, and among genuine
+    0-speed candidates the existing alphabetical tie-break is preserved.
+    """
+    tokens = path.stem.split("_")
+    if len(tokens) < 4 or not tokens[3].isdigit():
+        return 0
+    return int(tokens[3])
+
+
 def pick_device_config(configs_dir: Path, tier: str) -> Path:
-    """Choose a DRAMSim3 device .ini for a tier, by preference with fallback.
+    """Choose a DRAMSim3 device .ini for a tier, by family preference with
+    fallback, and by FASTEST available speed grade within the matched family.
+
+    Picking merely the alphabetically-first filename within a family was a
+    real bug, not just a stylistic choice: DRAMSim3 ships DDR4 in speed
+    grades from 1866 to 3200 MT/s, and "1866" sorts before "3200" as a
+    string, so the cxl tier's "commodity DRAM behind the link" was silently
+    characterised using one of the SLOWEST DDR4 parts DRAMSim3 ships
+    (``DDR4_4Gb_x16_1866.ini``) purely by chance of alphabetical order, not a
+    deliberate choice -- discovered when the resulting ~2.36 GB/s achieved
+    bandwidth prompted checking which exact device config produced it, and
+    ``DDR4_8Gb_x16_3200.ini`` (1.7x the clock, same x16 width) was sitting
+    right there, unpicked, the whole time. Now selects the highest parsed
+    speed grade within the family (see :func:`_parse_speed_mts`); ties (or a
+    device class with no speed variants, e.g. HBM2) fall back to the same
+    alphabetical order as before, so this only changes behaviour where a
+    genuinely faster same-family option existed and was previously missed.
 
     Raises:
         FileNotFoundError: listing what DRAMSim3 does ship, so the preference
@@ -113,16 +147,15 @@ def pick_device_config(configs_dir: Path, tier: str) -> Path:
     if not available:
         raise FileNotFoundError(f"no .ini device configs in {configs_dir}")
     for wanted in DEVICE_PREFERENCE[tier]:
-        for path in available:
-            # Exact match on the leading token (DRAMSim3 names configs
-            # "<TYPE>_<size>_<width>...ini"), not a bare substring check: "ddr5"
-            # is a substring of "gddr5x_8gb_x32.ini" (G-DDR5-X is graphics
-            # memory, an entirely different, wider-burst device class), which
-            # previously made the cxl tier silently pick GDDR5X over any real
-            # DDR5/DDR4 config and fail at runtime with a burst-size mismatch.
-            leading_token = path.stem.split("_")[0]
-            if leading_token.lower() == wanted.lower():
-                return path
+        # Exact match on the leading token (DRAMSim3 names configs
+        # "<TYPE>_<size>_<width>...ini"), not a bare substring check: "ddr5"
+        # is a substring of "gddr5x_8gb_x32.ini" (G-DDR5-X is graphics
+        # memory, an entirely different, wider-burst device class), which
+        # previously made the cxl tier silently pick GDDR5X over any real
+        # DDR5/DDR4 config and fail at runtime with a burst-size mismatch.
+        matches = [p for p in available if p.stem.split("_")[0].lower() == wanted.lower()]
+        if matches:
+            return min(matches, key=lambda p: (-_parse_speed_mts(p), p.name))
     raise FileNotFoundError(
         f"no DRAMSim3 config for tier {tier!r} matching any of "
         f"{DEVICE_PREFERENCE[tier]}.\nAvailable:\n"

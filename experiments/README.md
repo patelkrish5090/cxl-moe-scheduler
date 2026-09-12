@@ -86,12 +86,14 @@ On the real `mixtral_8x7b_decode` trace, `hbm_cxl_naive`'s ~6.8 s/token
 figure is this second case: accounting is consistent, and the exact
 decomposition (`n_hits`, `n_misses`, `mean_hit_latency_ns`,
 `mean_miss_latency_ns` — all always available on `ConfigResult`, not only
-when the ceiling fires) reproduces it exactly. **Still open**: whether the
-~2.36 GB/s effective cold-fetch bandwidth this implies is itself a
-deliberate fully-serial worst-case bound, or reflects a DRAMSim3/gem5 config
-issue — see `scheduler/README.md`'s "Is a large latency figure a units bug,
-or this model?" for what's confirmed and what's still pending real
-gem5/DRAMSim3 config data.
+when the ceiling fires) reproduces it exactly. The ~2.36 GB/s effective
+cold-fetch bandwidth this implied turned out to be a real, now-fixed
+DRAMSim3 device-config bug (`memsim/run_sweep.py::pick_device_config` was
+picking one of the slowest available DDR4 speed grades by alphabetical
+accident, not deliberately) — see `scheduler/README.md`'s "Is a large
+latency figure a units bug, or this model?" for the full resolution and
+`memsim/README.md` for the fix. Re-run the memsim sweep + `experiments.cli
+run` to get the corrected figure.
 
 ## Checkpoint 3 gap and eviction divergence
 

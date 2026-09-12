@@ -286,6 +286,42 @@ def main() -> int:
         check("cxl tier prefers DDR5 once it exists",
               pick_device_config(configs, "cxl").name == "DDR5_16Gb_x8_4800.ini")
 
+        # THE REAL REGRESSION: this project's own actual DRAMSim3 checkout
+        # ships DDR4 in speed grades from 1866 to 3200 MT/s, and the cxl
+        # tier's real sweep picked DDR4_4Gb_x16_1866.ini -- one of the
+        # SLOWEST -- purely because "1866" sorts alphabetically before
+        # "2133"/"2400"/.../"3200" as a string, not by any deliberate choice.
+        # Reproduce that exact file set (a representative subset of the real
+        # directory listing) and confirm the fastest speed grade wins now.
+        multi_speed = root / "multi_speed_ddr4"
+        multi_speed.mkdir()
+        for name in (
+            "DDR4_4Gb_x16_1866.ini", "DDR4_4Gb_x16_2133.ini", "DDR4_4Gb_x16_2400.ini",
+            "DDR4_4Gb_x16_2666.ini", "DDR4_8Gb_x16_2933.ini", "DDR4_8Gb_x16_3200.ini",
+            "HBM2_4Gb_x128.ini", "HBM2_8Gb_x128.ini",
+        ):
+            (multi_speed / name).write_text("[dram_structure]\n", encoding="utf-8")
+        check("cxl tier picks the FASTEST DDR4 speed grade present, not the "
+              "alphabetically-first one (the real bug: 1866 sorts before 3200)",
+              pick_device_config(multi_speed, "cxl").name == "DDR4_8Gb_x16_3200.ini",
+              f"got {pick_device_config(multi_speed, 'cxl').name}")
+        check("hbm tier's tie-break is unchanged for a device class with no speed "
+              "grade in its filename (HBM2 variants differ only by density) -- "
+              "falls back to alphabetical order, same as before this fix",
+              pick_device_config(multi_speed, "hbm").name == "HBM2_4Gb_x128.ini",
+              f"got {pick_device_config(multi_speed, 'hbm').name}")
+
+        # A "_debug" variant (no numeric speed token) must never be preferred
+        # over a real speed-graded part, even though its leading token also
+        # matches.
+        debug_dir = root / "with_debug"
+        debug_dir.mkdir()
+        for name in ("ddr4_debug.ini", "DDR4_4Gb_x16_1866.ini"):
+            (debug_dir / name).write_text("[dram_structure]\n", encoding="utf-8")
+        check("a _debug config (no parseable speed) never wins over a real speed-graded part",
+              pick_device_config(debug_dir, "cxl").name == "DDR4_4Gb_x16_1866.ini",
+              f"got {pick_device_config(debug_dir, 'cxl').name}")
+
         only_gddr = root / "only_gddr"
         only_gddr.mkdir()
         (only_gddr / "GDDR6_8Gb_x16.ini").write_text("", encoding="utf-8")

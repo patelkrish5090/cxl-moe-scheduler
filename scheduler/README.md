@@ -281,35 +281,39 @@ result — see `experiments/selftest.py`'s "mixed hit/miss fixture" check).
 This resolves "is the ACCOUNTING right" conclusively: on the real
 `mixtral_8x7b_decode` trace, it is.
 
-**Still open, and NOT yet resolved by the accounting check above**: whether
-`mean_miss_latency_ns`'s own magnitude (~149 ms, implying an effective
-~2.3 GB/s cold-fetch bandwidth) is a *deliberate* consequence of this
-project's fully-serial, no-pipelining fetch model, or a DRAMSim3/gem5 sweep
-config issue (real CXL links are commonly specified in the tens of GB/s).
-What's confirmed from the code so far:
+**RESOLVED (2026-09-12), against the real config**: `mean_miss_latency_ns`'s
+magnitude (~149 ms, ~2.36 GB/s effective cold-fetch bandwidth on the trace
+this figure came from) was the result of a genuine, now-fixed config bug —
+NOT a deliberate worst-case choice, and NOT random noise:
 
-- `memsim/run_sweep.py`'s `DEVICE_PREFERENCE` explicitly models the CXL
-  tier's memory as commodity DDR5/DDR4/DDR3 DRAM behind the link (not the
-  same HBM2 device class used for the `hbm` tier) — "the CXL tier is
-  commodity DRAM behind the link" is the comment in that dict. This IS a
-  deliberate, documented architectural choice: the number is not meant to
-  represent the CXL *link's* own theoretical max bandwidth, but the
-  achievable bandwidth of whatever DRAM sits behind it.
-- What is NOT yet confirmed: whether ~2.36 GB/s is a plausible *achieved*
-  fraction of that specific DDR device's real capability under this
-  project's traffic-generator access pattern (`tier.py`'s fixed-rate,
-  64-byte-block `PyTrafficGen`), or whether an unintentionally narrow/slow
-  device `.ini` was picked. That requires the actual `memsim/tier_model.json`
-  figures, the real sweep-point table (`python -m memsim.cli compare`'s
-  "[1] SWEEP POINTS" section — does bandwidth plateau as injection period
-  shrinks, or does it look generator-limited even at the slowest points?),
-  and the specific DRAMSim3 `.ini` file matched for the `cxl` tier (its
-  channel count / bus width sets its real theoretical ceiling) — none of
-  which are available from static code reading alone.
+- The real `memsim/tier_model.json` and `python -m memsim.cli compare`
+  sweep-point table (both pasted from the server) confirmed the cxl tier's
+  peak bandwidth is consistent across the fast injection periods (2.36 GB/s
+  at 100/1000/10000 ps) before dropping to the request-rate-limited 0.64 GB/s
+  at the slowest, unloaded point — a normal saturation curve, not a
+  generator artifact.
+- The real DRAMSim3 config listing showed the `cxl` tier's device match had
+  been `DDR4_4Gb_x16_1866.ini` — one of the SLOWEST DDR4 speed grades
+  DRAMSim3 ships (this checkout has zero DDR5 configs at all), picked only
+  because `pick_device_config` broke ties alphabetically and "1866" sorts
+  before "2133"/"2400"/.../"3200". A faster same-width option
+  (`DDR4_8Gb_x16_3200.ini`, 1.7x the clock) was sitting right there, unused.
+  **This was a real config bug, fixed** in `memsim/run_sweep.py`'s
+  `pick_device_config` — see `memsim/README.md`'s "Modelling limitations"
+  section for the full story and `memsim/selftest.py`'s regression test.
+- What remains a genuine, still-standing (not a bug) simplification even
+  after that fix: the cxl tier characterises a SINGLE DDR4 channel, not
+  multiple channels aggregated the way a real CXL memory expander commonly
+  is — that gap (single-channel commodity DDR vs a real multi-channel CXL
+  device's aggregate spec) is real and should stay explicitly stated
+  wherever this bandwidth figure is quoted, same as the HBM2-for-HBM3e
+  substitution already is.
 
-Until that's checked against the real config, treat `mean_miss_latency_ns`
-as internally consistent (the accounting is right) but NOT yet confirmed
-plausible in absolute terms.
+Re-running the memsim sweep + compare + `experiments.cli run` after this fix
+will produce an updated (faster, still single-channel-DDR4-bound)
+`mean_miss_latency_ns` and correspondingly lower `avg_latency_ms_per_token` —
+expect roughly the same ~1.7x improvement the speed-grade change implies,
+not a resolution of the single-channel-vs-multi-channel gap.
 
 ## Validation checkpoints
 

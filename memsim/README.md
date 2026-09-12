@@ -103,6 +103,29 @@ hide the difference between what was measured and what was assumed.
   latency and models no queuing, retries, or protocol overhead at the link.
 - Device energy is DRAMSim3's model from JEDEC-derived IDD parameters. It is a
   simulator output, not a hardware measurement (docs.md §7).
+- **The CXL tier characterises a SINGLE DDR4/DDR5 channel**, not multiple
+  channels aggregated the way a real CXL memory expander commonly is. This is
+  the actual reason the achieved cxl bandwidth (~GB/s, single digits) reads
+  low next to a real CXL device's aggregate spec (often tens of GB/s across
+  several channels) — it is not modelling a whole device, just one channel of
+  commodity DRAM behind the link. Adding multi-channel aggregation would be a
+  real scope increase (parallel DRAMSim3 instances or a wider channel config),
+  not a one-line fix; state this plainly rather than silently reading the
+  single-channel figure as if it were the full device's bandwidth.
+- `run_sweep.py::pick_device_config` selects the FASTEST speed grade DRAMSim3
+  ships within a device family (e.g. DDR4 up to 3200 MT/s), not merely
+  whichever filename happens to sort first. **This was a real bug until
+  2026-09-12**: this project's own DRAMSim3 checkout ships no DDR5 configs at
+  all, so the cxl tier fell back to DDR4 — and the picker's old alphabetical
+  tie-break silently chose `DDR4_4Gb_x16_1866.ini`, one of the SLOWEST DDR4
+  speed grades DRAMSim3 ships (1866 MT/s, versus 3200 MT/s available in the
+  same x16 width), purely because "1866" sorts before "3200" as a string.
+  That was never a deliberate "worst case" choice — see
+  `run_sweep.py::pick_device_config`'s docstring and
+  `memsim/selftest.py`'s "sweep planning" regression test (built from this
+  project's own real DRAMSim3 config directory listing). Re-run the sweep
+  (`python -m memsim.cli sweep ...` then `compare`) to pick up the corrected,
+  faster DDR4 config and get updated real numbers.
 
 ## Validation checkpoint 2
 
