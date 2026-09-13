@@ -198,6 +198,67 @@ def discover_routers(model: Any) -> list[RouterSite]:
     return sites
 
 
+def discover_dense_sites(model: Any) -> list[RouterSite]:
+    """Find each decoder layer's FFN/MLP block in a DENSE (non-MoE)
+    Transformer, wrapping each as a degenerate one-expert :class:`RouterSite`
+    (``num_experts=1``, ``top_k=1``) so :class:`DenseProfiler` can push a real
+    dense-model forward pass through the exact same trace/hot_cold.csv schema
+    stage 1 already uses for MoE models -- letting the two be compared on
+    identical axes (classify.py's gini/entropy, the dashboard's activation
+    heatmap and skew summary) without a parallel code path for dense models.
+
+    A dense model has no gating decision to record: every layer's single FFN
+    is used by every token, always. That triviality is not a limitation of
+    this function, it IS the result the dense-vs-MoE comparison exists to
+    produce -- a dense model's "hot/cold split" degenerates to "everything is
+    hot, there is no cold tier to exploit", in contrast to a genuinely skewed
+    MoE model.
+
+    Looks for a module literally named ``mlp`` on each decoder layer (matches
+    GPT-2, Llama, Mistral, and the dense-model family generally), excluding
+    any such module that is itself an MoE block (has a ``num_experts`` or
+    ``top_k`` attribute) -- that case belongs to :func:`discover_routers`,
+    not here.
+
+    Raises:
+        RuntimeError: if no dense FFN/MLP block is found.
+    """
+    if nn is None:  # pragma: no cover
+        raise RuntimeError("torch is required to discover dense FFN blocks")
+
+    modules = dict(model.named_modules())
+    sites: list[RouterSite] = []
+    seen: set[int] = set()
+    for name, module in modules.items():
+        if name.rsplit(".", 1)[-1] != "mlp":
+            continue
+        if hasattr(module, "num_experts") or hasattr(module, "top_k"):
+            continue  # an MoE block -- discover_routers' job, not this function's
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        expert_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
+        sites.append(RouterSite(
+            name=name,
+            layer_idx=_layer_index_from_name(name),
+            num_experts=1,
+            top_k=1,
+            expert_weight_bytes=expert_bytes,
+            module=module,
+        ))
+
+    if not sites:
+        raise RuntimeError(
+            "no dense FFN/MLP blocks found (looked for a module literally named "
+            "'mlp' on each decoder layer). Either this model names its FFN block "
+            "something else -- inspect [name for name, _ in model.named_modules()] "
+            "and extend discover_dense_sites in profiler/router_hooks.py -- or it is "
+            "actually an MoE model, in which case use discover_routers instead."
+        )
+    sites.sort(key=lambda s: (s.layer_idx, s.name))
+    return sites
+
+
 def _iter_tensors(obj: Any) -> Iterable[Any]:
     """Yield tensors from an arbitrarily nested tuple/list/dict router output."""
     if torch is not None and isinstance(obj, torch.Tensor):
@@ -512,3 +573,38 @@ class RouterProfiler:
             "nonfinite_logit_rows": int(self.nonfinite_logit_rows.sum()),
             "nonfinite_logit_rows_per_site": self.nonfinite_logit_rows.tolist(),
         }
+
+
+class DenseProfiler(RouterProfiler):
+    """Like :class:`RouterProfiler`, but for a DENSE (non-MoE) Transformer.
+
+    Use with :func:`discover_dense_sites` rather than :func:`discover_routers`.
+    Each site's module is a plain FFN/MLP block, not a router -- its forward
+    output is a hidden-state tensor (``[batch, seq, hidden]`` or already
+    flattened ``[tokens, hidden]``), not a ``[tokens, num_experts]`` logits
+    tensor, so :func:`extract_routing` does not apply. Every real token that
+    reaches this layer is, by construction, a real dispatch to the single
+    "expert 0" this site has (``num_experts=1``, ``top_k=1``) -- there is no
+    gating decision to extract, only a shape to read the token count from.
+    Everything else (trace buffering, per-site counts, ``begin_batch``
+    bookkeeping) is inherited unchanged from :class:`RouterProfiler`.
+    """
+
+    def _make_hook(self, site_idx: int):
+        def hook(_module: Any, _inputs: Any, output: Any) -> None:
+            hidden = output[0] if isinstance(output, tuple) else output
+            if hidden.ndim == 3:
+                n_rows = hidden.shape[0] * hidden.shape[1]
+            elif hidden.ndim == 2:
+                n_rows = hidden.shape[0]
+            else:
+                site = self.sites[site_idx]
+                raise RuntimeError(
+                    f"dense site {site.name!r}: unexpected MLP output shape "
+                    f"{tuple(hidden.shape)}; expected a 2D [tokens, hidden] or "
+                    "3D [batch, seq, hidden] hidden-state tensor"
+                )
+            indices = torch.zeros((n_rows, 1), dtype=torch.int64, device=hidden.device)
+            self._record(site_idx, indices, logits=None)
+
+        return hook

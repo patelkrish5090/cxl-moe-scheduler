@@ -28,11 +28,27 @@ CONFIG_LABELS = {
 
 
 def list_comparison_results(results_dir: str | Path = "experiments/results") -> list[Path]:
-    """Every experiment-comparison JSON written by experiments.cli run."""
+    """Every experiment-comparison JSON written by experiments.cli run.
+
+    experiments/results/ is also where scheduler.cli pool --out writes CXL
+    pooling results (list_pooling_results) -- both write into the same
+    directory by convention, so a pooling JSON must be excluded here (it has
+    no "configs" key and would otherwise raise a KeyError the moment
+    load_comparison tried to read it), the same way list_pooling_results
+    excludes comparison files by checking for "gpu_names" instead.
+    """
     results_dir = Path(results_dir)
     if not results_dir.is_dir():
         return []
-    return sorted(results_dir.glob("*.json"))
+    found = []
+    for path in sorted(results_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if "configs" in payload:
+            found.append(path)
+    return found
 
 
 def load_comparison_payload(path: str | Path) -> dict:
@@ -176,3 +192,96 @@ def build_expert_skew_summary(hot_cold_csv: str | Path, top_n: int = 5) -> dict:
         "top": _rows(ranked.head(top_n)),
         "bottom": _rows(ranked.tail(top_n)),
     }
+
+
+def load_run_metadata(run_dir: str | Path) -> dict:
+    """``run_metadata.json`` from a stage-1 run directory -- model topology
+    (experts/layer, top_k, total weight bytes) and the real classification
+    summary (gini_overall, normalized_entropy_overall, hot_dispatch_share),
+    written by profiler.runner.run() for every run, MoE or dense alike.
+
+    Raises:
+        FileNotFoundError: if run_metadata.json does not exist.
+    """
+    run_dir = Path(run_dir)
+    path = run_dir / "run_metadata.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no run_metadata.json at {path}. Produce it with:\n"
+            "  python -m profiler.cli run <config.json>"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_model_comparison(run_dirs: list[str | Path]) -> pd.DataFrame:
+    """One row per stage-1 run, for comparing architectures/scales side by
+    side -- the "scalability" (expert count) and "dense vs MoE" comparisons
+    the dashboard's Model Comparison panel renders. Every field comes
+    straight from that run's own real run_metadata.json; nothing here is
+    computed, estimated, or hardcoded per model.
+
+    Raises:
+        FileNotFoundError: if any run_dir lacks a run_metadata.json (see
+            load_run_metadata).
+        KeyError: if a run_metadata.json is missing an expected key (an
+            older or malformed run) -- surfaced rather than silently
+            producing a row of blanks.
+    """
+    rows = []
+    for run_dir in run_dirs:
+        run_dir = Path(run_dir)
+        meta = load_run_metadata(run_dir)
+        topo = meta["model_topology"]
+        classification = meta["classification"]
+        experts_per_layer = topo["experts_per_layer"]
+        rows.append({
+            "run_name": meta["run_name"],
+            "model": meta["config"]["model"]["name_or_path"],
+            "architecture": meta["config"]["model"].get("architecture", "moe"),
+            "n_layers": topo["n_moe_layers"],
+            "experts_per_layer": experts_per_layer[0] if experts_per_layer else None,
+            "top_k": topo["top_k"],
+            "total_expert_weight_gb": topo["total_expert_weight_bytes"] / 1e9,
+            "total_dispatches": classification["total_dispatches"],
+            "gini_overall": classification["gini_overall"],
+            "entropy_overall": classification["normalized_entropy_overall"],
+            "hot_dispatch_share": classification["hot_dispatch_share"],
+        })
+    return pd.DataFrame(rows)
+
+
+def list_pooling_results(results_dir: str | Path = "experiments/results") -> list[Path]:
+    """Every CXL-pooling JSON written by ``scheduler.cli pool --out``.
+
+    Distinguished from a three-way comparison result by the presence of a
+    top-level ``"gpu_names"`` key (comparison results have ``"configs"``
+    instead) -- both are written into the same results directory by
+    convention, so list_comparison_results alone would also match these.
+    """
+    results_dir = Path(results_dir)
+    if not results_dir.is_dir():
+        return []
+    found = []
+    for path in sorted(results_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if "gpu_names" in payload:
+            found.append(path)
+    return found
+
+
+def load_pooling_result(path: str | Path) -> dict:
+    """Raw JSON payload of a ``scheduler.cli pool --out`` result.
+
+    Raises:
+        FileNotFoundError: if path does not exist.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no pooling result at {path}. Produce one with:\n"
+            "  python -m scheduler.cli pool <gpu0_run_dir> <gpu1_run_dir> --out <path>"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))

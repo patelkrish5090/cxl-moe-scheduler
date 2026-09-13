@@ -39,6 +39,14 @@ class ModelConfig:
             with another job so accelerate does not claim memory that is already
             in use. Note that accelerate places weights only -- leave headroom
             for activations and KV cache on top of the model size.
+        architecture: "moe" (default) discovers MoE routers via
+            router_hooks.discover_routers + RouterProfiler. "dense" discovers
+            each decoder layer's plain FFN/MLP block via
+            router_hooks.discover_dense_sites + DenseProfiler instead, for
+            profiling a genuinely dense (non-MoE) Transformer on the SAME
+            trace/hot_cold.csv schema, so it can be compared against an MoE
+            run's activation skew on identical axes (see profiler/README.md's
+            "Dense vs MoE" section).
     """
 
     name_or_path: str
@@ -49,6 +57,11 @@ class ModelConfig:
     attn_implementation: str | None = "sdpa"
     random_init: bool = False
     max_memory: dict[str, str] | None = None
+    architecture: str = "moe"
+
+    def __post_init__(self) -> None:
+        if self.architecture not in {"moe", "dense"}:
+            raise ValueError(f"model.architecture must be 'moe' or 'dense', got {self.architecture!r}")
 
 
 @dataclass

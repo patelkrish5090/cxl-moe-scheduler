@@ -21,7 +21,7 @@ from . import activation_log, data, plots
 from .activation_log import TraceWriter, write_counts_csv, write_metadata
 from .classify import classify
 from .config import RunConfig
-from .router_hooks import RouterProfiler, discover_routers
+from .router_hooks import DenseProfiler, RouterProfiler, discover_dense_sites, discover_routers
 
 
 def _resolve_dtype(name: str) -> Any:
@@ -264,14 +264,19 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
     device = _first_param_device(model)
     log(f"      loaded on {device}")
 
-    log("[2/6] discovering MoE routers")
-    sites = discover_routers(model)
+    is_dense = cfg.model.architecture == "dense"
+    if is_dense:
+        log("[2/6] discovering dense FFN/MLP blocks (model.architecture='dense')")
+        sites = discover_dense_sites(model)
+    else:
+        log("[2/6] discovering MoE routers")
+        sites = discover_routers(model)
     layer_ids = [s.layer_idx for s in sites]
     experts_per_site = [s.num_experts for s in sites]
     expert_bytes = [s.expert_weight_bytes for s in sites]
     total_expert_bytes = sum(b * e for b, e in zip(expert_bytes, experts_per_site))
     log(
-        f"      {len(sites)} MoE layers | experts/layer={experts_per_site[0]} "
+        f"      {len(sites)} layers | experts/layer={experts_per_site[0]} "
         f"| top_k={sites[0].top_k} | expert weight size="
         f"{expert_bytes[0] / 1e6:.1f} MB each, {total_expert_bytes / 1e9:.2f} GB total"
     )
@@ -304,11 +309,17 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
     writer = TraceWriter(trace_path) if cfg.profiler.record_trace else None
 
     log("[4/6] profiling")
-    profiler = RouterProfiler(
+    profiler_cls = DenseProfiler if is_dense else RouterProfiler
+    profiler = profiler_cls(
         model,
         sites=sites,
         record_trace=cfg.profiler.record_trace,
-        cross_check=cfg.profiler.cross_check_router,
+        # cross_check compares recomputed top-k against router-emitted
+        # indices from real logits; a dense site has no logits at all
+        # (DenseProfiler always passes logits=None), so it is meaningless
+        # here regardless of the config value -- forcing it off avoids ever
+        # reporting a hollow "0/0 mismatch" as if it were a real check.
+        cross_check=False if is_dense else cfg.profiler.cross_check_router,
     )
     n_batches = int(np.ceil(sequences.shape[0] / cfg.data.batch_size))
     forward_seconds = 0.0
@@ -400,9 +411,10 @@ def run(cfg: RunConfig, verbose: bool = True) -> dict[str, Any]:
 
     summary = profiler.summary()
     if summary["total_dispatches"] == 0:
+        site_kind = "dense FFN/MLP blocks" if is_dense else "MoE routers"
         raise RuntimeError(
-            "no expert dispatches were recorded. The routers were discovered but never "
-            "fired -- check that the model actually contains MoE layers on the executed path."
+            f"no dispatches were recorded. The {site_kind} were discovered but never "
+            "fired -- check that the model actually executes those layers on the run path."
         )
     if summary["cross_check_mismatch"]:
         rate = summary["cross_check_mismatch_rate"]

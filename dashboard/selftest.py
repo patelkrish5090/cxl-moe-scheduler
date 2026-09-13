@@ -17,10 +17,14 @@ from .data import (
     CONFIG_ORDER,
     build_expert_skew_summary,
     build_heatmap_grid,
+    build_model_comparison,
     list_comparison_results,
+    list_pooling_results,
     list_stage1_runs,
     load_comparison,
     load_comparison_payload,
+    load_pooling_result,
+    load_run_metadata,
 )
 
 failures: list[str] = []
@@ -247,6 +251,104 @@ def main() -> int:
             raised_skew_missing = True
         check("build_expert_skew_summary raises FileNotFoundError on a missing file",
               raised_skew_missing)
+
+        print("\n[load_run_metadata / build_model_comparison]")
+        moe_run = root / "moe_run"
+        moe_run.mkdir()
+        moe_meta = {
+            "run_name": "moe_run",
+            "config": {"model": {"name_or_path": "models/mixtral", "architecture": "moe"}},
+            "model_topology": {
+                "n_moe_layers": 32, "top_k": 2, "experts_per_layer": [8] * 32,
+                "total_expert_weight_bytes": 90_000_000_000,
+            },
+            "classification": {
+                "total_dispatches": 500_000, "gini_overall": 0.115,
+                "normalized_entropy_overall": 0.996, "hot_dispatch_share": 0.72,
+            },
+        }
+        (moe_run / "run_metadata.json").write_text(json.dumps(moe_meta), encoding="utf-8")
+
+        dense_run = root / "dense_run"
+        dense_run.mkdir()
+        dense_meta = {
+            "run_name": "dense_run",
+            "config": {"model": {"name_or_path": "gpt2", "architecture": "dense"}},
+            "model_topology": {
+                "n_moe_layers": 12, "top_k": 1, "experts_per_layer": [1] * 12,
+                "total_expert_weight_bytes": 230_000_000,
+            },
+            "classification": {
+                "total_dispatches": 864, "gini_overall": 0.0,
+                "normalized_entropy_overall": 1.0, "hot_dispatch_share": 1.0,
+            },
+        }
+        (dense_run / "run_metadata.json").write_text(json.dumps(dense_meta), encoding="utf-8")
+
+        loaded_meta = load_run_metadata(moe_run)
+        check("load_run_metadata returns the raw dict, run_name intact",
+              loaded_meta["run_name"] == "moe_run")
+
+        missing_meta = root / "does_not_exist_run"
+        raised_meta_missing = False
+        try:
+            load_run_metadata(missing_meta)
+        except FileNotFoundError as exc:
+            raised_meta_missing = "profiler.cli run" in str(exc)
+        check("load_run_metadata raises on a missing file, naming the producing command",
+              raised_meta_missing)
+
+        comparison_df = build_model_comparison([moe_run, dense_run])
+        check("build_model_comparison returns one row per run, in the order given",
+              list(comparison_df["run_name"]) == ["moe_run", "dense_run"],
+              f"got {list(comparison_df['run_name'])}")
+        check("build_model_comparison surfaces architecture, experts/layer, and gini per run",
+              comparison_df.loc[0, "architecture"] == "moe"
+              and comparison_df.loc[0, "experts_per_layer"] == 8
+              and comparison_df.loc[0, "gini_overall"] == 0.115
+              and comparison_df.loc[1, "architecture"] == "dense"
+              and comparison_df.loc[1, "experts_per_layer"] == 1
+              and comparison_df.loc[1, "gini_overall"] == 0.0,
+              f"got\n{comparison_df}")
+        check("build_model_comparison converts total weight bytes to GB",
+              abs(comparison_df.loc[0, "total_expert_weight_gb"] - 90.0) < 1e-6,
+              f"got {comparison_df.loc[0, 'total_expert_weight_gb']}")
+
+        print("\n[list_pooling_results / load_pooling_result]")
+        pooling_payload = {
+            "gpu_names": ["gpu0", "gpu1"],
+            "per_gpu_cold_bytes": {"gpu0": 2000, "gpu1": 2000},
+            "dedicated_total_cold_bytes": 4000,
+            "pooled_total_cold_bytes": 3000,
+            "savings_bytes": 1000,
+            "savings_pct": 25.0,
+            "shared_cold_pairs": 1,
+            "total_unique_cold_pairs": 3,
+        }
+        pooling_path = results_dir / "mixtral_pooling.json"
+        pooling_path.write_text(json.dumps(pooling_payload), encoding="utf-8")
+
+        found_pooling = list_pooling_results(results_dir)
+        check("list_pooling_results finds the pooling file and excludes the comparison file",
+              found_pooling == [pooling_path], f"got {found_pooling}")
+
+        check("list_comparison_results excludes the pooling file sharing the same directory "
+              "(the real bug this pairing exists to catch: both write into experiments/results/)",
+              pooling_path not in list_comparison_results(results_dir),
+              f"got {list_comparison_results(results_dir)}")
+
+        loaded_pooling = load_pooling_result(pooling_path)
+        check("load_pooling_result returns the raw dict, savings_pct intact",
+              loaded_pooling["savings_pct"] == 25.0)
+
+        missing_pooling = results_dir / "does_not_exist_pooling.json"
+        raised_pooling_missing = False
+        try:
+            load_pooling_result(missing_pooling)
+        except FileNotFoundError as exc:
+            raised_pooling_missing = "scheduler.cli pool" in str(exc)
+        check("load_pooling_result raises on a missing file, naming the producing command",
+              raised_pooling_missing)
 
     print("\n" + "=" * 62)
     if failures:

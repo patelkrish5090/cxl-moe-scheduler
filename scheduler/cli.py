@@ -5,6 +5,7 @@
     python -m scheduler.cli run data/runs/<name> --policy energy-aware-defer --power-budget-w 50
     python -m scheduler.cli run data/runs/<name> --policy energy-aware-evict
     python -m scheduler.cli compare3 data/runs/<name> --power-budget-w 50   # docs.md 6 checkpoint 3
+    python -m scheduler.cli pool data/runs/<gpu0_name> data/runs/<gpu1_name>  # CXL pooling study
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+
+import pandas as pd
 
 from .model import (
     CostModel,
@@ -21,6 +24,7 @@ from .model import (
     load_tier_model,
     load_trace,
 )
+from .pooling import analyze_pooled_memory
 from .simulate import (
     diff_decisions,
     eviction_divergence_report,
@@ -115,6 +119,35 @@ def _cmd_compare3(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pool(args: argparse.Namespace) -> int:
+    """CXL memory pooling: dedicated vs shared-pool cold-expert storage
+    across N real per-GPU stage-1 runs (docs.md's "CXL memory expansion &
+    pooling study" deliverable). Each --run-dir is one real per-GPU run
+    directory (needs hot_cold.csv); named by directory name unless
+    --names overrides.
+    """
+    run_dirs = [Path(p) for p in args.run_dir]
+    names = args.names.split(",") if args.names else [p.name for p in run_dirs]
+    if len(names) != len(run_dirs):
+        print(f"--names has {len(names)} entries but {len(run_dirs)} run dirs were given", file=sys.stderr)
+        return 2
+
+    tables: dict[str, pd.DataFrame] = {}
+    for name, run_dir in zip(names, run_dirs):
+        hot_cold_path = run_dir / "hot_cold.csv"
+        if not hot_cold_path.is_file():
+            print(f"no hot_cold.csv at {hot_cold_path}", file=sys.stderr)
+            return 2
+        tables[name] = pd.read_csv(hot_cold_path)
+
+    report = analyze_pooled_memory(tables)
+    print(report.summary())
+    if args.out:
+        written = report.write(args.out)
+        print(f"\nwrote {written}")
+    return 0
+
+
 def _cmd_selftest(_args: argparse.Namespace) -> int:
     from .selftest import main as selftest_main
     return selftest_main()
@@ -143,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
                              help="only used for the energy-aware-defer leg")
     p_compare3.add_argument("--tier-model", default="memsim/tier_model.json")
     p_compare3.set_defaults(func=_cmd_compare3)
+
+    p_pool = sub.add_parser("pool", help="CXL pooling: dedicated vs shared-pool cold-expert storage across N real per-GPU runs")
+    p_pool.add_argument("run_dir", nargs="+", help="2+ real per-GPU stage-1 run directories")
+    p_pool.add_argument("--names", default=None, help="comma-separated names, one per run_dir (default: directory names)")
+    p_pool.add_argument("--out", default=None, help="also write the report as JSON (for the dashboard) to this path")
+    p_pool.set_defaults(func=_cmd_pool)
 
     p_selftest = sub.add_parser("selftest", help="offline correctness checks, no data needed")
     p_selftest.set_defaults(func=_cmd_selftest)

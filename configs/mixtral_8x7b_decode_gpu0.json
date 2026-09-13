@@ -1,0 +1,32 @@
+{
+  "run_name": "mixtral_8x7b_decode_gpu0",
+  "model": {
+    "name_or_path": "models/mixtral",
+    "dtype": "bfloat16",
+    "device_map": "cuda:0",
+    "attn_implementation": "eager"
+  },
+  "data": {
+    "dataset": "Salesforce/wikitext",
+    "subset": "wikitext-2-raw-v1",
+    "split": "test",
+    "seq_len": 256,
+    "max_sequences": 8,
+    "batch_size": 1
+  },
+  "profiler": {
+    "record_trace": true,
+    "trace_flush_rows": 2000000,
+    "cross_check_router": true,
+    "max_new_tokens": 256,
+    "sample": true,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "seed": 1234
+  },
+  "classify": {
+    "method": "top_fraction",
+    "value": 0.25,
+    "per_layer": true
+  }
+}

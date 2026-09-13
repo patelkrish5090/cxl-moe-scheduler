@@ -224,6 +224,40 @@ Two flags interact with this:
   two tables are averages over different layer samples — compare them as
   populations, not row by row.
 
+## Dense vs MoE
+
+The original problem statement's objectives ask to "analyze Transformer and
+MoE memory access patterns" -- everything above profiles the MoE half. To
+give the MoE skew a real point of comparison rather than an assertion, set
+`model.architecture: "dense"` (default: `"moe"`) to profile a genuinely
+dense (non-MoE) Transformer instead. `configs/gpt2_dense_decode.json` /
+`gpt2_dense_wikitext2.json` do this against a real GPT-2 checkpoint.
+
+```bash
+python -m profiler.cli run configs/gpt2_dense_wikitext2.json
+python -m profiler.cli run configs/gpt2_dense_decode.json
+```
+
+**How it works**: a dense Transformer has no gating function to hook --
+`router_hooks.discover_dense_sites` finds each decoder layer's plain FFN/MLP
+block instead (matched by the attribute name `mlp`, e.g. GPT-2/Llama/Mistral),
+and `router_hooks.DenseProfiler` records every real token that reaches that
+layer as a dispatch to a degenerate single "expert 0" (`num_experts=1`,
+`top_k=1`). This is not a routing decision -- there is no gate -- but it pushes
+a real dense-model forward pass through the EXACT same trace/hot_cold.csv
+schema stage 1 already uses for MoE models, so `classify.py`'s gini/entropy,
+`plots.py`'s heatmap, and the dashboard's activation-skew summary all work on
+a dense run unmodified, and the two can be compared on identical axes.
+
+**Expected, and confirmed real** result: Gini = 0.000, every layer 100% "hot"
+(there is no cold tier, because there is nothing to split -- every layer's
+single FFN is used by every token, always). This is not a placeholder or a
+degenerate edge case being tolerated -- it IS the finding: unlike an MoE
+model's real, measurable per-layer skew (see "Locality and the layer split"
+above), a dense Transformer has no hot/cold split to exploit at all, so
+expert tiering has nothing to offer it. That is the direct, data-backed
+answer to why this project's tiering strategy is MoE-specific.
+
 ## Threshold methods
 
 `classify.method` in the run config:
@@ -239,12 +273,17 @@ deterministic.
 
 ## Correctness checks
 
-`python -m profiler.cli selftest` (56 checks) builds tiny models in-process —
+`python -m profiler.cli selftest` (66 checks) builds tiny models in-process —
 no Hub access — and verifies profiler counts against an **independently**
 computed ground truth: a separate pre-hook captures each router's input hidden
 states and redoes the top-k from scratch, outside the profiler's code path. It
 also covers both router return shapes, decode-phase position bookkeeping,
-padding-mask exclusion, every threshold method, and log I/O round-trips.
+padding-mask exclusion, every threshold method, log I/O round-trips, and (a
+real, tiny GPT2LMHeadModel, not a mock) `discover_dense_sites` +
+`DenseProfiler`'s dense-mode path — confirms every real token dispatches to
+the degenerate single expert at every layer, and that classification comes
+out trivially all-hot with Gini exactly 0, the expected result for a model
+with nothing to route.
 
 `tests/test_runner_integration.py` runs `runner.run()` end to end with only the
 two network calls stubbed, then checks that `trace.parquet` aggregates back to

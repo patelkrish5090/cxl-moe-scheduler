@@ -71,6 +71,28 @@ empty chart (CLAUDE.md).
    "cross-layer washout regression" test, which reproduces that exact bug on
    a constructed example (two maximally-skewed layers with identical
    per-expert totals, correctly still reported as skewed, not uniform).
+5. **Model comparison** — the "scalability" (expert count) and "dense vs
+   MoE" objectives, in one panel: select 2+ real stage-1 runs (any model,
+   any architecture -- Mixtral-8x7B, OLMoE, or a real dense GPT-2 run from
+   `profiler`'s `architecture: "dense"` mode) and compare Gini, experts/layer,
+   entropy, and total expert weight side by side. Every figure comes straight
+   from each run's own real `run_metadata.json`
+   (`dashboard.data.build_model_comparison`) -- nothing is computed or
+   estimated for this panel. A dense run always shows experts/layer=1 and
+   Gini=0.000 by construction, which is the finding, not a placeholder: see
+   `profiler/README.md`'s "Dense vs MoE" section.
+6. **CXL pooling** — the "pooling" half of the "CXL memory expansion &
+   pooling" deliverable (distinct from the single-GPU "expansion" modelled
+   everywhere else on this page): dedicated (each GPU stores its own cold
+   experts) vs pooled (one shared CXL pool stores each unique cold expert
+   once) storage, from `scheduler.cli pool <gpu0_run_dir> <gpu1_run_dir>
+   --out <path>` over two REAL per-GPU stage-1 runs of the same model. Zero
+   overlap between the GPUs' cold sets renders as zero savings, explicitly
+   labelled a real result rather than treated as an error. Deliberately does
+   NOT show a shared-link bandwidth-contention latency estimate --
+   `scheduler/pooling.py`'s docstring explains why that would be
+   mathematically vacuous without a genuine concurrent discrete-event
+   simulator (out of scope here).
 
 ## Architecture
 
@@ -102,7 +124,16 @@ exactly, that `load_comparison_payload` carries the `checkpoint3` and
 `build_expert_skew_summary`'s per-(layer,expert)-bin Gini and max/mean ratio
 match an independent recompute (including the degenerate perfectly-uniform
 case, where Gini must be exactly 0 and the ratio exactly 1.0, and the
-cross-layer washout regression case described above).
+cross-layer washout regression case described above), that
+`build_model_comparison` surfaces each run's real architecture/experts-per-
+layer/Gini from its own `run_metadata.json` in the order given, and that
+`list_comparison_results` / `list_pooling_results` correctly exclude each
+other's files even though `experiments.cli run` and `scheduler.cli pool
+--out` both write into `experiments/results/` by convention (a real bug
+caught during development: the pooling and three-way-comparison JSON files
+share no common key structure, so loading one as the other raised a raw
+`KeyError` instead of a helpful message, until both list functions were
+taught to check for a distinguishing key first).
 
 The app itself (`dashboard/app.py`) was verified headlessly with
 Streamlit's own `streamlit.testing.v1.AppTest` during development, both

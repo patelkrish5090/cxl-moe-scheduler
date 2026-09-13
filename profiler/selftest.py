@@ -21,7 +21,13 @@ from pathlib import Path
 import numpy as np
 
 from .classify import ClassifyConfig, classify, coverage_curve, gini, normalized_entropy
-from .router_hooks import RouterProfiler, discover_routers, extract_routing
+from .router_hooks import (
+    DenseProfiler,
+    RouterProfiler,
+    discover_dense_sites,
+    discover_routers,
+    extract_routing,
+)
 
 _PASS = 0
 _FAIL = 0
@@ -81,6 +87,73 @@ def test_discovery(verbose: bool = True) -> None:
     _check("expert weight bytes match config arithmetic",
            all(s.expert_weight_bytes == expected_bytes for s in sites),
            f"got {sites[0].expert_weight_bytes}, expected {expected_bytes}", verbose)
+
+
+def _tiny_gpt2():
+    """A tiny, real GPT2LMHeadModel (dense, non-MoE) built from an in-code
+    config -- the same real HF model class used for profiler/README.md's
+    "Dense vs MoE" comparison, just small enough to construct instantly.
+    """
+    import torch
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    torch.manual_seed(0)
+    config = GPT2Config(n_layer=3, n_embd=32, n_head=2, n_positions=64, vocab_size=100)
+    model = GPT2LMHeadModel(config)
+    model.eval()
+    return model, config
+
+
+def test_dense_discovery(verbose: bool = True) -> None:
+    """discover_dense_sites + DenseProfiler against a real (if tiny) dense
+    Transformer -- the counterpart to test_discovery's MoE case. See
+    profiler/README.md's "Dense vs MoE" section for what this is for.
+    """
+    import torch
+
+    print("\n[dense discovery]")
+    model, config = _tiny_gpt2()
+    sites = discover_dense_sites(model)
+    _check("one dense FFN/MLP site per transformer layer",
+           len(sites) == config.n_layer, f"found {len(sites)}, expected {config.n_layer}", verbose)
+    _check("every dense site is a degenerate single-expert site (num_experts=1, top_k=1)",
+           all(s.num_experts == 1 and s.top_k == 1 for s in sites), verbose=verbose)
+    _check("layer indices are 0..n-1",
+           [s.layer_idx for s in sites] == list(range(config.n_layer)),
+           f"got {[s.layer_idx for s in sites]}", verbose)
+    _check("expert_weight_bytes is a real, positive parameter count (not zero/placeholder)",
+           all(s.expert_weight_bytes > 0 for s in sites), verbose=verbose)
+
+    batch_size, seq_len = 2, 5
+    profiler = DenseProfiler(model, sites=sites, record_trace=True, cross_check=False)
+    with torch.no_grad(), profiler:
+        profiler.begin_batch(batch_size=batch_size, seq_len=seq_len, phase="prefill")
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        model(input_ids=input_ids, attention_mask=torch.ones(batch_size, seq_len, dtype=torch.long))
+
+    expected_dispatches = batch_size * seq_len
+    _check("every layer recorded exactly one dispatch per real token processed",
+           all(int(profiler.counts[i, 0]) == expected_dispatches for i in range(config.n_layer)),
+           f"got {profiler.counts.tolist()}, expected {expected_dispatches} per layer", verbose)
+    _check("no dispatch ever went to any expert other than 0 (there is only one)",
+           profiler.max_experts == 1, verbose=verbose)
+
+    trace = profiler.take_trace()
+    _check("trace row count matches total dispatches exactly",
+           len(trace["token_uid"]) == expected_dispatches * config.n_layer,
+           f"got {len(trace['token_uid'])}", verbose)
+    _check("every trace row's expert_id is 0 (the degenerate single expert)",
+           bool((trace["expert_id"] == 0).all()), verbose=verbose)
+
+    layer_ids = [s.layer_idx for s in sites]
+    experts_per_site = [s.num_experts for s in sites]
+    expert_bytes = [s.expert_weight_bytes for s in sites]
+    result = classify(profiler.counts, ClassifyConfig(method="top_fraction", value=0.25, per_layer=True),
+                       layer_ids=layer_ids, experts_per_site=experts_per_site, expert_weight_bytes=expert_bytes)
+    _check("a dense model's classification is trivially all-hot (nothing to mark cold)",
+           bool(result.table["is_hot"].all()), verbose=verbose)
+    _check("a dense model's overall Gini is exactly 0 -- no skew possible with one expert per layer",
+           result.overall["gini_overall"] == 0.0, f"got {result.overall['gini_overall']}", verbose)
 
 
 def test_extract_routing(verbose: bool = True) -> None:
@@ -453,6 +526,7 @@ def main(verbose: bool = True) -> int:
     _PASS = _FAIL = 0
     print("stage-1 profiler selftest (offline, CPU, no model downloads)")
     test_discovery(verbose)
+    test_dense_discovery(verbose)
     test_extract_routing(verbose)
     test_legacy_linear_gate_discovery(verbose)
     test_counts_against_ground_truth(verbose)

@@ -26,6 +26,7 @@ from .model import (
     load_tier_model,
     load_trace,
 )
+from .pooling import analyze_pooled_memory
 from .simulate import (
     _SiteCache,
     diff_decisions,
@@ -367,6 +368,55 @@ def main() -> int:
     check("diff refuses to compare runs of different length",
           "cannot diff" in diff_decisions(result, mismatched))
 
+    print("\n[CXL pooling: memory footprint]")
+    # 2 GPUs, same model (so a "cold at (layer,expert)" match is byte-for-byte
+    # the same real weights on either GPU -- the dedup is real, not assumed).
+    # gpu0: layer0/expert1 and layer1/expert0 cold. gpu1: layer0/expert1
+    # (SHARED with gpu0) and layer1/expert2 (NOT shared) cold.
+    def _hot_cold(cold_pairs: set[tuple[int, int]], n_layers: int = 2, n_experts: int = 3) -> pd.DataFrame:
+        rows = []
+        for layer in range(n_layers):
+            for expert in range(n_experts):
+                rows.append({
+                    "layer_idx": layer, "expert_id": expert,
+                    "is_hot": (layer, expert) not in cold_pairs,
+                    "expert_weight_bytes": 1000,
+                })
+        return pd.DataFrame(rows)
+
+    gpu0_table = _hot_cold({(0, 1), (1, 0)})
+    gpu1_table = _hot_cold({(0, 1), (1, 2)})
+    pooled = analyze_pooled_memory({"gpu0": gpu0_table, "gpu1": gpu1_table})
+
+    check("pooling: per-GPU cold bytes match an independent recompute (2 cold experts each, 1000B)",
+          pooled.per_gpu_cold_bytes["gpu0"] == 2000 and pooled.per_gpu_cold_bytes["gpu1"] == 2000,
+          f"got {pooled.per_gpu_cold_bytes}")
+    check("pooling: dedicated total is the sum of both GPUs' own cold bytes (2000+2000=4000)",
+          pooled.dedicated_total_cold_bytes == 4000, f"got {pooled.dedicated_total_cold_bytes}")
+    check("pooling: pooled total counts (0,1) only ONCE despite being cold on both GPUs "
+          "(3 unique cold pairs total: (0,1) shared, (1,0), (1,2) -- 3000B, not 4000B)",
+          pooled.pooled_total_cold_bytes == 3000, f"got {pooled.pooled_total_cold_bytes}")
+    check("pooling: savings = dedicated - pooled = 1000B (25%)",
+          pooled.savings_bytes == 1000 and math.isclose(pooled.savings_pct, 25.0),
+          f"got savings={pooled.savings_bytes}, pct={pooled.savings_pct}")
+    check("pooling: exactly 1 (layer,expert) pair is shared across 2+ GPUs",
+          pooled.shared_cold_pairs == 1, f"got {pooled.shared_cold_pairs}")
+    check("pooling: 3 total unique cold pairs across both GPUs",
+          pooled.total_unique_cold_pairs == 3, f"got {pooled.total_unique_cold_pairs}")
+
+    print("\n[CXL pooling: no overlap -- zero savings is a real result, not a bug]")
+    disjoint = analyze_pooled_memory({
+        "gpu0": _hot_cold({(0, 0)}), "gpu1": _hot_cold({(1, 1)}),
+    })
+    check("pooling: disjoint cold sets across GPUs give exactly zero savings",
+          disjoint.savings_bytes == 0 and disjoint.shared_cold_pairs == 0,
+          f"got savings={disjoint.savings_bytes}, shared={disjoint.shared_cold_pairs}")
+    check("pooling: dedicated == pooled total when nothing is shared",
+          disjoint.dedicated_total_cold_bytes == disjoint.pooled_total_cold_bytes)
+
+    check("pooling: refuses fewer than 2 GPUs",
+          _raises_value_error(lambda: analyze_pooled_memory({"gpu0": gpu0_table})))
+
     print("\n[file loading]")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -429,6 +479,14 @@ def main() -> int:
 def _raises_on_bad_budget(trace: pd.DataFrame, cm: CostModel) -> bool:
     try:
         run_energy_aware_defer(trace, cm, cache_capacity={0: 1}, power_budget_w=0.0)
+    except ValueError:
+        return True
+    return False
+
+
+def _raises_value_error(fn) -> bool:
+    try:
+        fn()
     except ValueError:
         return True
     return False

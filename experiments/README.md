@@ -86,14 +86,19 @@ On the real `mixtral_8x7b_decode` trace, `hbm_cxl_naive`'s ~6.8 s/token
 figure is this second case: accounting is consistent, and the exact
 decomposition (`n_hits`, `n_misses`, `mean_hit_latency_ns`,
 `mean_miss_latency_ns` — all always available on `ConfigResult`, not only
-when the ceiling fires) reproduces it exactly. The ~2.36 GB/s effective
-cold-fetch bandwidth this implied turned out to be a real, now-fixed
-DRAMSim3 device-config bug (`memsim/run_sweep.py::pick_device_config` was
-picking one of the slowest available DDR4 speed grades by alphabetical
-accident, not deliberately) — see `scheduler/README.md`'s "Is a large
-latency figure a units bug, or this model?" for the full resolution and
-`memsim/README.md` for the fix. Re-run the memsim sweep + `experiments.cli
-run` to get the corrected figure.
+when the ceiling fires) reproduces it exactly. The ~2.35 GB/s effective
+cold-fetch bandwidth this implies was checked, with a controlled real-config
+experiment, against two explanations: a DRAMSim3 device-selection bug (there
+was one — `memsim/run_sweep.py::pick_device_config` was picking one of the
+slowest available DDR4 speed grades by alphabetical accident — now fixed),
+and a link/generator-concurrency bottleneck. Fixing the device-selection bug
+and re-running left bandwidth unchanged (2.36 -> 2.35 GB/s) while device
+energy per bit nearly doubled — ruling out the DRAM device as the limiter.
+The determined cause is the CXL link path's limited request concurrency, a
+deliberate-in-effect worst-case bound consistent with this project's
+scheduler-level no-overlap model — see `scheduler/README.md`'s "Is a large
+latency figure a units bug, or this model?" for the full evidence trail and
+`memsim/README.md` for the complete story.
 
 ## Checkpoint 3 gap and eviction divergence
 

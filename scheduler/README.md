@@ -281,39 +281,89 @@ result — see `experiments/selftest.py`'s "mixed hit/miss fixture" check).
 This resolves "is the ACCOUNTING right" conclusively: on the real
 `mixtral_8x7b_decode` trace, it is.
 
-**RESOLVED (2026-09-12), against the real config**: `mean_miss_latency_ns`'s
-magnitude (~149 ms, ~2.36 GB/s effective cold-fetch bandwidth on the trace
-this figure came from) was the result of a genuine, now-fixed config bug —
-NOT a deliberate worst-case choice, and NOT random noise:
+**DETERMINED (2026-09-12), with a controlled real-config experiment**:
+`mean_miss_latency_ns`'s magnitude (~149-150 ms, ~2.35 GB/s effective
+cold-fetch bandwidth) is bottlenecked by the CXL link/traffic-generator
+path's limited request concurrency, NOT by the underlying DRAM device's own
+bandwidth, and NOT a units or accounting bug. This was checked, not assumed:
 
-- The real `memsim/tier_model.json` and `python -m memsim.cli compare`
-  sweep-point table (both pasted from the server) confirmed the cxl tier's
-  peak bandwidth is consistent across the fast injection periods (2.36 GB/s
-  at 100/1000/10000 ps) before dropping to the request-rate-limited 0.64 GB/s
-  at the slowest, unloaded point — a normal saturation curve, not a
-  generator artifact.
-- The real DRAMSim3 config listing showed the `cxl` tier's device match had
-  been `DDR4_4Gb_x16_1866.ini` — one of the SLOWEST DDR4 speed grades
-  DRAMSim3 ships (this checkout has zero DDR5 configs at all), picked only
-  because `pick_device_config` broke ties alphabetically and "1866" sorts
-  before "2133"/"2400"/.../"3200". A faster same-width option
-  (`DDR4_8Gb_x16_3200.ini`, 1.7x the clock) was sitting right there, unused.
-  **This was a real config bug, fixed** in `memsim/run_sweep.py`'s
-  `pick_device_config` — see `memsim/README.md`'s "Modelling limitations"
-  section for the full story and `memsim/selftest.py`'s regression test.
-- What remains a genuine, still-standing (not a bug) simplification even
-  after that fix: the cxl tier characterises a SINGLE DDR4 channel, not
-  multiple channels aggregated the way a real CXL memory expander commonly
-  is — that gap (single-channel commodity DDR vs a real multi-channel CXL
-  device's aggregate spec) is real and should stay explicitly stated
-  wherever this bandwidth figure is quoted, same as the HBM2-for-HBM3e
-  substitution already is.
+- `memsim/run_sweep.py::pick_device_config` previously selected
+  `DDR4_4Gb_x16_1866.ini` for the cxl tier by alphabetical accident (see
+  `memsim/README.md`), rather than the faster `DDR4_8Gb_x16_3200.ini` DRAMSim3
+  ships in the same width. That WAS a real selection bug and is fixed.
+- But re-running the full sweep with the corrected (1.7x faster clock, per
+  `tCK`: 1.07 ns vs 0.63 ns, confirmed by reading both `.ini` files directly)
+  DDR4-3200 part left achieved cxl bandwidth **unchanged** (2.36 -> 2.35
+  GB/s, if anything fractionally lower) while device energy per bit nearly
+  DOUBLED (29.70 -> 56.68 pJ/bit) — the signature of a part burning more
+  power per operation for no extra throughput. If the DRAM channel's own
+  speed were the bottleneck, doubling its effective clock should have moved
+  achieved bandwidth by roughly the same ~1.7x; it did not move at all. This
+  rules out DRAM clock/config as the limiter, with direct controlled
+  evidence (two genuinely different real clock speeds, same outcome), not a
+  guess.
+- The `hbm` tier (direct-attach, no `Bridge`, no added link latency) shows no
+  such flatness — its 24 GB/s is a real function of its own device config.
+  The cxl tier's extra hop (`membus -> Bridge -> linkbus -> mem_ctrl`,
+  `tier.py`) is architecturally the one place bandwidth could be capped by
+  something other than the DRAM device itself: the `Bridge`'s fixed
+  `CXL_LINK_LATENCY_NS` round-trip delay, combined with gem5's default
+  outstanding-request queue depth on that path, most plausibly explains a
+  throughput ceiling that is independent of which DRAM sits behind it.
 
-Re-running the memsim sweep + compare + `experiments.cli run` after this fix
-will produce an updated (faster, still single-channel-DDR4-bound)
-`mean_miss_latency_ns` and correspondingly lower `avg_latency_ms_per_token` —
-expect roughly the same ~1.7x improvement the speed-grade change implies,
-not a resolution of the single-channel-vs-multi-channel gap.
+**What this means for the number**: `mean_miss_latency_ns` is not measuring
+"this specific commodity DRAM part's bandwidth" so much as "the throughput of
+one traffic-generator stream against a fixed-round-trip-delay link at gem5's
+default queue depth" — which is, in spirit, the SAME single-outstanding-
+request/no-overlap assumption this project already states explicitly at the
+scheduler level (`_run()`'s fully-serial dispatch loop, "WHAT THIS DOES NOT
+MODEL" above), just also present one layer down, in how the memory tier
+itself was characterised in stage 2. Treat it as a deliberate, stated
+worst-case bound consistent with the rest of this project's modelling
+choices, not an unexplained anomaly or a bug still to chase — but state this
+explicitly next to the number (dashboard caption, `experiments/README.md`),
+exactly as this note now does, rather than implying it is a direct read of
+real CXL/DRAM bandwidth specs.
+
+The DDR4 speed-grade fix in `pick_device_config` is still worth keeping (it
+is strictly more correct — never pick the slowest available part by
+alphabetical accident, and the corrected part's device-energy figure is more
+representative of a real DDR4-3200 chip) even though it turned out not to be
+what explained the bandwidth ceiling.
+
+## CXL memory pooling (`scheduler/pooling.py`)
+
+The problem statement's deliverable list separates "CXL memory **expansion**"
+(everything above -- one GPU offloading cold experts to one CXL-attached
+tier) from "CXL memory expansion **& pooling**" -- pooling means multiple
+GPUs sharing ONE CXL memory pool, instead of each having its own dedicated
+CXL allocation.
+
+`python -m scheduler.cli pool <gpu0_run_dir> <gpu1_run_dir> [...]` compares,
+using REAL per-GPU stage-1 runs (e.g. `configs/mixtral_8x7b_decode_gpu0.json`
+/ `_gpu1.json`, run on `cuda:0` / `cuda:1` respectively over different
+corpus slices): **dedicated** storage (each GPU keeps its own private copy
+of its own cold experts) vs **pooled** storage (one shared CXL pool stores
+each unique cold `(layer, expert)` pair exactly once, regardless of how many
+GPUs need it). Since both GPUs run the SAME model, a cold expert at
+`(layer=3, expert=5)` is byte-for-byte the same weights on either GPU, so
+the dedup is real, not approximate.
+
+**What this deliberately does NOT model**: shared-link bandwidth contention
+(two GPUs' cold fetches competing for one physical link's throughput at the
+same simulated instant). `scheduler/pooling.py`'s own module docstring
+explains why an earlier draft's attempt at this was abandoned: summing two
+independent GPUs' per-dispatch latencies in any interleaved order gives the
+same total regardless of order (addition is order-independent), so a
+"round-robin merge onto one shared clock" produces a number that LOOKS like
+a contention estimate but is mathematically identical to the no-contention
+sum -- not a real effect. A genuine contention model needs an actual
+concurrent discrete-event simulation (independent per-GPU clocks, splitting
+a fixed shared bandwidth budget only when both need the link at the same
+simulated instant), which is a real scope increase beyond this project's
+existing single-clock, fully-serial simulator -- not attempted here. The
+memory-footprint dedup savings above are real and fully computed; the
+timing side of pooling is explicitly out of scope, not silently skipped.
 
 ## Validation checkpoints
 
