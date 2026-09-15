@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Astera Pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f5f2ec;
+    --surface: #ffffff;
+    --ink: #211d17;
+    --ink-dim: #6f6656;
+    --ink-faint: #a89d89;
+    --line: #ddd4c2;
+    --line-strong: #c7bba3;
+    --accent: #b5601f;
+    --accent-soft: #f1e0cd;
+    --accent-ink: #7a3f11;
+    --shadow: rgba(74, 58, 30, 0.08);
+    --mono-tint: #efeadf;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1a1712;
+      --surface: #221e17;
+      --ink: #f2ece0;
+      --ink-dim: #b5a991;
+      --ink-faint: #7d735e;
+      --line: #3a3427;
+      --line-strong: #4c4433;
+      --accent: #e08a3e;
+      --accent-soft: #3a2c1a;
+      --accent-ink: #f4b87b;
+      --shadow: rgba(0, 0, 0, 0.35);
+      --mono-tint: #262117;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #1a1712;
+    --surface: #221e17;
+    --ink: #f2ece0;
+    --ink-dim: #b5a991;
+    --ink-faint: #7d735e;
+    --line: #3a3427;
+    --line-strong: #4c4433;
+    --accent: #e08a3e;
+    --accent-soft: #3a2c1a;
+    --accent-ink: #f4b87b;
+    --shadow: rgba(0, 0, 0, 0.35);
+    --mono-tint: #262117;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+    padding-inline: clamp(16px, 4vw, 56px);
+    padding-block: clamp(28px, 5vw, 56px);
+  }
+
+  .wrap {
+    max-width: 1180px;
+    margin-inline: auto;
+  }
+
+  header {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: clamp(28px, 4vw, 44px);
+  }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(1.7rem, 3.4vw, 2.3rem);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  .lede {
+    margin: 0;
+    max-width: 62ch;
+    color: var(--ink-dim);
+    font-size: 0.98rem;
+    line-height: 1.55;
+  }
+
+  .lede code {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.88em;
+    background: var(--mono-tint);
+    padding: 0.1em 0.4em;
+    border-radius: 4px;
+    color: var(--ink);
+  }
+
+  /* ---- pipeline strip ---- */
+
+  .pipeline {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    align-items: stretch;
+    gap: 0;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface);
+    box-shadow: 0 1px 2px var(--shadow);
+    overflow: hidden;
+  }
+
+  .stage {
+    position: relative;
+    padding: 22px 20px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    border-right: 1px solid var(--line);
+  }
+
+  .stage:last-child { border-right: none; }
+
+  .stage::after {
+    content: "→";
+    position: absolute;
+    right: -13px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent);
+    color: var(--surface);
+    border-radius: 50%;
+    font-size: 0.85rem;
+    z-index: 2;
+    box-shadow: 0 0 0 3px var(--surface);
+  }
+
+  .stage:last-child::after { content: none; }
+
+  .stage-num {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    width: fit-content;
+    padding: 2px 8px;
+    border-radius: 999px;
+    letter-spacing: 0.04em;
+  }
+
+  .stage-name {
+    font-size: 1.12rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+
+  .stage-folder {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    margin-top: -8px;
+  }
+
+  .stage-desc {
+    font-size: 0.87rem;
+    line-height: 1.5;
+    color: var(--ink-dim);
+    flex-grow: 1;
+  }
+
+  .stage-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .tool-tag {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.7rem;
+    color: var(--ink-dim);
+    background: var(--mono-tint);
+    border: 1px solid var(--line);
+    padding: 3px 7px;
+    border-radius: 5px;
+  }
+
+  .stage-io {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--line-strong);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.74rem;
+    line-height: 1.5;
+  }
+
+  .stage-io .row {
+    display: flex;
+    gap: 6px;
+  }
+
+  .stage-io .k {
+    color: var(--ink-faint);
+    flex-shrink: 0;
+  }
+
+  .stage-io .v {
+    color: var(--ink);
+    word-break: break-word;
+  }
+
+  /* ---- final output banner ---- */
+
+  .final {
+    margin-top: 18px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 16px 20px;
+    background: var(--accent-soft);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    flex-wrap: wrap;
+  }
+
+  .final .flag {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent-ink);
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  .final p {
+    margin: 0;
+    font-size: 0.88rem;
+    color: var(--ink);
+    line-height: 1.5;
+  }
+
+  /* ---- legend / caption ---- */
+
+  .caption {
+    margin-top: 22px;
+    font-size: 0.82rem;
+    color: var(--ink-faint);
+    line-height: 1.6;
+    max-width: 78ch;
+  }
+
+  @media (max-width: 860px) {
+    .pipeline {
+      grid-template-columns: 1fr;
+    }
+    .stage {
+      border-right: none;
+      border-bottom: 1px solid var(--line);
+    }
+    .stage:last-child { border-bottom: none; }
+    .stage::after {
+      content: "↓";
+      right: 50%;
+      top: auto;
+      bottom: -13px;
+      transform: translateX(50%);
+    }
+    .stage:last-child::after { content: none; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <span class="eyebrow">Astera &middot; project pipeline</span>
+      <h1>Energy-aware CXL-MoE scheduler, stage by stage</h1>
+      <p class="lede">
+        Four stages, each one feeding real output into the next: a real model's
+        expert traffic, timed and costed by a real memory simulator, replayed
+        through a scheduler, and compared on a dashboard. No stage invents a
+        number the stage before it didn't produce.
+      </p>
+    </header>
+
+    <div class="pipeline">
+      <div class="stage">
+        <span class="stage-num">STAGE 1</span>
+        <div class="stage-name">Profiler</div>
+        <div class="stage-folder">/profiler</div>
+        <p class="stage-desc">
+          Hooks a real Hugging Face MoE model while it runs and logs, per token,
+          which expert each layer routes to. Splits experts into hot (frequently
+          used) and cold (rarely used) per site.
+        </p>
+        <div class="stage-tools">
+          <span class="tool-tag">transformers</span>
+          <span class="tool-tag">PyTorch hooks</span>
+        </div>
+        <div class="stage-io">
+          <div class="row"><span class="k">in&nbsp;</span><span class="v">Mixtral-8x7B / OLMoE / GPT-2</span></div>
+          <div class="row"><span class="k">out</span><span class="v">trace.parquet, hot_cold.csv</span></div>
+        </div>
+      </div>
+
+      <div class="stage">
+        <span class="stage-num">STAGE 2</span>
+        <div class="stage-name">Memsim</div>
+        <div class="stage-folder">/memsim</div>
+        <p class="stage-desc">
+          Simulates GPU HBM and CXL-attached host memory as physical devices, to
+          get real latency, bandwidth and energy-per-bit numbers for each tier.
+          No CXL hardware exists here, so this stage stands in for it.
+        </p>
+        <div class="stage-tools">
+          <span class="tool-tag">gem5</span>
+          <span class="tool-tag">DRAMSim3</span>
+        </div>
+        <div class="stage-io">
+          <div class="row"><span class="k">in&nbsp;</span><span class="v">DRAM/CXL device configs</span></div>
+          <div class="row"><span class="k">out</span><span class="v">tier_model.json</span></div>
+        </div>
+      </div>
+
+      <div class="stage">
+        <span class="stage-num">STAGE 3</span>
+        <div class="stage-name">Scheduler</div>
+        <div class="stage-folder">/scheduler</div>
+        <p class="stage-desc">
+          Replays the real traffic trace against the real tier costs, deciding
+          which experts sit in fast HBM versus slower CXL. Runs a naive baseline
+          alongside the energy-aware eviction policy for a fair comparison.
+        </p>
+        <div class="stage-tools">
+          <span class="tool-tag">cache simulation</span>
+          <span class="tool-tag">pJ/bit cost model</span>
+        </div>
+        <div class="stage-io">
+          <div class="row"><span class="k">in&nbsp;</span><span class="v">trace.parquet + tier_model.json</span></div>
+          <div class="row"><span class="k">out</span><span class="v">SimulationResult (hits, misses, energy)</span></div>
+        </div>
+      </div>
+
+      <div class="stage">
+        <span class="stage-num">STAGE 4</span>
+        <div class="stage-name">Experiments &amp; dashboard</div>
+        <div class="stage-folder">/experiments &middot; /dashboard</div>
+        <p class="stage-desc">
+          Runs all three configs, HBM-only, naive, and energy-aware, over one
+          trace and packages throughput, latency and energy into a comparison,
+          shown live on a Streamlit dashboard.
+        </p>
+        <div class="stage-tools">
+          <span class="tool-tag">run harness</span>
+          <span class="tool-tag">Streamlit</span>
+        </div>
+        <div class="stage-io">
+          <div class="row"><span class="k">in&nbsp;</span><span class="v">SimulationResult &times; 3 configs</span></div>
+          <div class="row"><span class="k">out</span><span class="v">comparison.json &rarr; dashboard charts</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="final">
+      <span class="flag">Result</span>
+      <p>
+        One table, three ways to place expert weights: HBM-only (idealised),
+        HBM+CXL naive, and HBM+CXL energy-aware, each with real throughput,
+        latency and total energy, driven end to end from one real model run.
+      </p>
+    </div>
+
+    <p class="caption">
+      Each arrow is a real file on disk, not a conceptual handoff: stage 1's
+      <code style="font-family:'IBM Plex Mono',monospace">hot_cold.csv</code>
+      feeds stage 3 directly, stage 2's
+      <code style="font-family:'IBM Plex Mono',monospace">tier_model.json</code>
+      feeds stage 3's cost model, and stage 3's results feed stage 4's
+      comparison and dashboard. See CLAUDE.md and docs.md for the full spec
+      this pipeline follows.
+    </p>
+  </div>
+</body>
+</html>

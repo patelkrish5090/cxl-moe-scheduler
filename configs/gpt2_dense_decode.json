@@ -1,0 +1,32 @@
+{
+  "run_name": "gpt2_dense_decode",
+  "model": {
+    "name_or_path": "gpt2",
+    "dtype": "bfloat16",
+    "device_map": "cuda:0",
+    "architecture": "dense"
+  },
+  "data": {
+    "dataset": "Salesforce/wikitext",
+    "subset": "wikitext-2-raw-v1",
+    "split": "test",
+    "seq_len": 256,
+    "max_sequences": 8,
+    "batch_size": 1
+  },
+  "profiler": {
+    "record_trace": true,
+    "trace_flush_rows": 2000000,
+    "cross_check_router": false,
+    "max_new_tokens": 256,
+    "sample": true,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "seed": 1234
+  },
+  "classify": {
+    "method": "top_fraction",
+    "value": 0.25,
+    "per_layer": true
+  }
+}

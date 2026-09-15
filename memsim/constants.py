@@ -1,0 +1,210 @@
+"""Physical constants for the memory model, each tagged with its provenance.
+
+CLAUDE.md forbids two things this module exists to make impossible:
+
+  1. A bare magic number with no source.
+  2. An invented number that looks plausible enough to survive into a plot.
+
+Every constant here is a :class:`Constant` carrying its unit and its source. A
+constant we have not yet sourced is declared with ``PLACEHOLDER`` as its value,
+which is ``float('nan')``. That choice is deliberate: NaN propagates through
+arithmetic, so any total computed from an unsourced constant comes out NaN and
+cannot be mistaken for a result, printed in a table, or plotted. There is no way
+to accidentally ship a fabricated figure.
+
+Use :func:`unsourced` to list what still needs a citation, and
+:func:`require_sourced` to fail loudly before presenting numbers as final.
+
+UNITS
+-----
+Energy is picojoules (``_pj``), time is nanoseconds (``_ns``), bandwidth is
+gigabytes per second (``_gbps``), sizes are bytes (``_bytes``). Suffixes are
+mandatory on every name -- mixing pJ and nJ is the classic silent bug in energy
+code and the suffix is what makes a mismatch visible at the call site.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Literal
+
+PLACEHOLDER = float("nan")
+
+Status = Literal["cited", "placeholder", "simulated", "derived"]
+
+
+@dataclass(frozen=True)
+class Constant:
+    """One physical constant and where it came from.
+
+    Attributes:
+        name: Identifier used in reports and provenance lists.
+        value: The number, in ``unit``. ``PLACEHOLDER`` (NaN) if unsourced.
+        unit: Explicit unit string, e.g. "pJ/bit", "ns", "GB/s".
+        source: Citation, or -- for a placeholder -- what to go and find.
+        status: ``cited`` (from a named datasheet or paper), ``simulated``
+            (produced by a real gem5/DRAMSim3 run, not typed in by hand),
+            ``derived`` (computed from other constants here), or
+            ``placeholder`` (not yet sourced; value is NaN).
+    """
+
+    name: str
+    value: float
+    unit: str
+    source: str
+    status: Status
+
+    @property
+    def is_sourced(self) -> bool:
+        """False if this constant still needs a citation before publication."""
+        return self.status != "placeholder" and not math.isnan(self.value)
+
+    def __float__(self) -> float:
+        return float(self.value)
+
+    def describe(self) -> str:
+        if self.status == "placeholder":
+            marker, shown = "!!", "TODO_PLACEHOLDER"
+        elif math.isnan(self.value):
+            marker, shown = "..", "(pending a run)"
+        else:
+            marker, shown = "  ", f"{self.value:g}"
+        return f"{marker} {self.name:<32} {shown:>18} {self.unit:<10} [{self.status}] {self.source}"
+
+
+CXL_LINK_LATENCY_NS = Constant(
+    name="CXL_LINK_LATENCY_NS",
+    value=200.0,
+    unit="ns",
+    source="Round-trip latency a CXL Type 3 memory controller adds vs local "
+           "DDR, attributed to Siamak Tavallaei (CXL Consortium president), "
+           "quoted in 'Just How Bad Is CXL Memory Latency?', The Next "
+           "Platform, Dec 2022 (nextplatform.com/store/2022/12/05/"
+           "just-how-bad-is-cxl-memory-latency). Corroborated in the same "
+           "article by Astera Labs' Leo CXL controller field measurements "
+           "(170-250 ns) and GigaIO's observations of real CXL Type 3 "
+           "expansion modules (~250 ns). A general CXL 2.0-era figure, not "
+           "tied to one vendor/device or PHY generation; the source does not "
+           "state idle vs loaded, so treat this as a typical/representative "
+           "round trip, not a confirmed-idle figure -- revisit if a "
+           "loaded-latency number is needed for a saturated workload.",
+    status="cited",
+)
+
+CXL_LINK_ENERGY_PJ_PER_BIT = Constant(
+    name="CXL_LINK_ENERGY_PJ_PER_BIT",
+    value=11.4,
+    unit="pJ/bit",
+    source="PCIe Gen5 (32 GT/s) SerDes energy including PLL and clocking, "
+           "from 'A 32Gb/s NRZ 37dB SerDes in 10nm CMOS to Support PCI "
+           "Express Gen 5 Protocol' (IEEE, "
+           "ieeexplore.ieee.org/document/9075947). Used as a proxy for CXL "
+           "PHY energy since CXL 2.0/3.0 runs over the PCIe 5.0/6.0 physical "
+           "layer -- this is PHY-level SerDes energy only, with no separate "
+           "figure available for CXL protocol-layer overhead on top of it. "
+           "Reported as a single per-lane SerDes figure; the source excerpt "
+           "does not confirm whether this is TX-only or a full transceiver, "
+           "so treat as one lane's aggregate figure rather than a confirmed "
+           "per-direction number.",
+    status="cited",
+)
+
+
+HBM_DEVICE_ENERGY = Constant(
+    name="HBM_DEVICE_ENERGY",
+    value=PLACEHOLDER,
+    unit="pJ/bit",
+    source="DRAMSim3 device model, IDD parameters from the shipped HBM .ini "
+           "(JEDEC-derived). Produced per run, not hardcoded.",
+    status="simulated",
+)
+
+CXL_DEVICE_ENERGY = Constant(
+    name="CXL_DEVICE_ENERGY",
+    value=PLACEHOLDER,
+    unit="pJ/bit",
+    source="DRAMSim3 device model for the DRAM behind the CXL link, IDD "
+           "parameters from the shipped DDR .ini. Produced per run.",
+    status="simulated",
+)
+
+ALL_CONSTANTS: tuple[Constant, ...] = (
+    CXL_LINK_LATENCY_NS,
+    CXL_LINK_ENERGY_PJ_PER_BIT,
+    HBM_DEVICE_ENERGY,
+    CXL_DEVICE_ENERGY,
+)
+
+
+def unsourced() -> list[Constant]:
+    """Constants that still need a citation before any result can be published.
+
+    ``simulated`` constants are excluded: their value arrives from a real gem5
+    or DRAMSim3 run rather than from this file, so a NaN here means "not run
+    yet", not "not sourced".
+    """
+    return [c for c in ALL_CONSTANTS if c.status == "placeholder"]
+
+
+def require_sourced(context: str = "this result") -> None:
+    """Raise if any constant needed for a publishable number is still a placeholder.
+
+    Call this before writing a final results table or plot. Reports that are
+    explicitly labelled as preliminary should call :func:`provenance_report`
+    and print the banner instead of raising.
+
+    Raises:
+        RuntimeError: naming every outstanding constant.
+    """
+    missing = unsourced()
+    if missing:
+        names = "\n".join(f"    {c.name} ({c.unit}) -- {c.source}" for c in missing)
+        raise RuntimeError(
+            f"{context} depends on {len(missing)} unsourced constant(s):\n{names}\n"
+            "Fill these in with a real citation in memsim/constants.py, or mark "
+            "the output as preliminary."
+        )
+
+
+def provenance_report() -> str:
+    """Human-readable table of every constant and its source."""
+    lines = [
+        "CONSTANT PROVENANCE",
+        "  '!!' needs a citation before any result using it can be published.",
+        "  '..' comes from a gem5/DRAMSim3 run and is simply not measured yet.",
+        "",
+    ]
+    lines.extend(c.describe() for c in ALL_CONSTANTS)
+    missing = unsourced()
+    lines.append("")
+    if missing:
+        lines.append(f"  {len(missing)} constant(s) unsourced -- any total computed "
+                     "from them is NaN by design.")
+    else:
+        lines.append("  All constants sourced.")
+    return "\n".join(lines)
+
+
+def bits_from_bytes(n_bytes: float) -> float:
+    """Bytes -> bits."""
+    return n_bytes * 8.0
+
+
+def energy_pj(pj_per_bit: float, n_bytes: float) -> float:
+    """Energy in picojoules to move ``n_bytes`` at ``pj_per_bit``.
+
+    Returns NaN if ``pj_per_bit`` came from an unsourced constant, which is how
+    a placeholder makes itself visible downstream.
+    """
+    return pj_per_bit * bits_from_bytes(n_bytes)
+
+
+def pj_to_joules(pj: float) -> float:
+    """Picojoules -> joules."""
+    return pj * 1e-12
+
+
+def pj_to_millijoules(pj: float) -> float:
+    """Picojoules -> millijoules, the readable scale for one expert fetch."""
+    return pj * 1e-9

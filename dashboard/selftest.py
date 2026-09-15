@@ -1,0 +1,352 @@
+"""Offline correctness checks for dashboard/data.py -- the pure data
+functions dashboard/app.py's Streamlit UI renders. The UI itself isn't
+unit-testable in this project's check()-based style (it needs a running
+Streamlit server), but the data it's fed should be held to the same standard
+as every other stage: no silently-wrong numbers reaching the page.
+"""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+
+from .data import (
+    CONFIG_ORDER,
+    build_expert_skew_summary,
+    build_heatmap_grid,
+    build_model_comparison,
+    list_comparison_results,
+    list_pooling_results,
+    list_stage1_runs,
+    load_comparison,
+    load_comparison_payload,
+    load_pooling_result,
+    load_run_metadata,
+)
+
+failures: list[str] = []
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    if condition:
+        print(f"  PASS  {name}")
+    else:
+        failures.append(name)
+        print(f"  FAIL  {name}" + (f"\n        {detail}" if detail else ""))
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        print("\n[list_comparison_results / list_stage1_runs: missing directories]")
+        check("an absent results dir gives an empty list, not an exception",
+              list_comparison_results(root / "does_not_exist") == [])
+        check("an absent data/runs dir gives an empty list, not an exception",
+              list_stage1_runs(root / "does_not_exist") == [])
+
+        print("\n[load_comparison]")
+        results_dir = root / "results"
+        results_dir.mkdir()
+        payload = {
+            "run_name": "test_run",
+            "configs": {
+                "hbm_only": {
+                    "throughput_tokens_per_sec": 100.0, "avg_latency_ns_per_token": 10.0,
+                    "avg_latency_ms_per_token": 10.0 * 1e-6,
+                    "total_energy_mj": 1.0, "hit_rate": 1.0, "n_tokens": 50, "n_dispatches": 400,
+                    "n_hits": 400, "n_misses": 0, "mean_hit_latency_ns": 5.0, "mean_miss_latency_ns": 0.0,
+                    "latency_accounting_consistent": True,
+                    "latency_plausible": True, "latency_warning": None,
+                },
+                "hbm_cxl_naive": {
+                    "throughput_tokens_per_sec": 10.0, "avg_latency_ns_per_token": 100.0,
+                    "avg_latency_ms_per_token": 100.0 * 1e-6,
+                    "total_energy_mj": 5.0, "hit_rate": 0.3, "n_tokens": 50, "n_dispatches": 400,
+                    "n_hits": 120, "n_misses": 280, "mean_hit_latency_ns": 8.0, "mean_miss_latency_ns": 130.0,
+                    "latency_accounting_consistent": True,
+                    "latency_plausible": True, "latency_warning": None,
+                },
+                "hbm_cxl_energy_aware": {
+                    "throughput_tokens_per_sec": 12.0, "avg_latency_ns_per_token": 83.0,
+                    "avg_latency_ms_per_token": 83.0 * 1e-6,
+                    "total_energy_mj": 4.5, "hit_rate": 0.35, "n_tokens": 50, "n_dispatches": 400,
+                    "n_hits": 140, "n_misses": 260, "mean_hit_latency_ns": 7.0, "mean_miss_latency_ns": 115.0,
+                    "latency_accounting_consistent": True,
+                    "latency_plausible": True, "latency_warning": None,
+                },
+            },
+            "checkpoint3": {
+                "energy_gap_pct": 10.0, "energy_gap_is_marginal": False, "marginal_threshold_pct": 1.0,
+            },
+            "eviction_divergence": {
+                "total_eviction_events": 20, "divergent_eviction_events": 15,
+                "divergence_rate": 0.75, "examples": [],
+            },
+        }
+        result_path = results_dir / "test_run.json"
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        check("list_comparison_results finds the written file",
+              list_comparison_results(results_dir) == [result_path])
+
+        df = load_comparison(result_path)
+        check("load_comparison returns one row per config, in CONFIG_ORDER",
+              list(df["config"]) == CONFIG_ORDER, f"got {list(df['config'])}")
+        check("throughput values round-trip exactly",
+              list(df["throughput_tokens_per_sec"]) == [100.0, 10.0, 12.0],
+              f"got {list(df['throughput_tokens_per_sec'])}")
+        check("every config has a non-empty human-readable label",
+              all(isinstance(lbl, str) and lbl for lbl in df["label"]))
+
+        missing = results_dir / "does_not_exist.json"
+        raised = False
+        try:
+            load_comparison(missing)
+        except FileNotFoundError as exc:
+            raised = "experiments.cli run" in str(exc)
+        check("a missing comparison file raises, naming the command that produces it", raised)
+
+        malformed_path = results_dir / "malformed.json"
+        malformed_path.write_text(json.dumps({"run_name": "x", "configs": {"hbm_only": payload["configs"]["hbm_only"]}}),
+                                   encoding="utf-8")
+        raised_key_error = False
+        try:
+            load_comparison(malformed_path)
+        except KeyError:
+            raised_key_error = True
+        check("a comparison file missing a config raises, not silently drops a row",
+              raised_key_error)
+
+        print("\n[load_comparison_payload]")
+        raw = load_comparison_payload(result_path)
+        check("load_comparison_payload returns the raw dict, run_name intact",
+              raw["run_name"] == "test_run")
+        check("load_comparison_payload carries checkpoint3 section through untouched",
+              raw["checkpoint3"]["energy_gap_pct"] == 10.0)
+        check("load_comparison_payload carries eviction_divergence section through untouched",
+              raw["eviction_divergence"]["divergence_rate"] == 0.75)
+        raised_payload_missing = False
+        try:
+            load_comparison_payload(missing)
+        except FileNotFoundError as exc:
+            raised_payload_missing = "experiments.cli run" in str(exc)
+        check("load_comparison_payload raises on a missing file, naming the producing command",
+              raised_payload_missing)
+
+        check("load_comparison surfaces the ms-latency and plausibility columns",
+              list(df["avg_latency_ms_per_token"]) == [10.0 * 1e-6, 100.0 * 1e-6, 83.0 * 1e-6]
+              and list(df["latency_plausible"]) == [True, True, True],
+              f"got {df[['avg_latency_ms_per_token', 'latency_plausible']]}")
+        check("load_comparison surfaces the hit/miss latency-breakdown columns",
+              list(df["n_hits"]) == [400, 120, 140] and list(df["n_misses"]) == [0, 280, 260]
+              and list(df["latency_accounting_consistent"]) == [True, True, True],
+              f"got {df[['n_hits', 'n_misses', 'latency_accounting_consistent']]}")
+
+        print("\n[list_stage1_runs]")
+        data_runs_dir = root / "data_runs"
+        (data_runs_dir / "empty_placeholder").mkdir(parents=True)
+        real_run_dir = data_runs_dir / "real_run"
+        real_run_dir.mkdir()
+        (real_run_dir / "hot_cold.csv").write_text("site_idx,layer_idx,expert_id,layer_share\n0,0,0,1.0\n",
+                                                     encoding="utf-8")
+        found_runs = list_stage1_runs(data_runs_dir)
+        check("only the run directory with a real hot_cold.csv is listed",
+              found_runs == [real_run_dir], f"got {found_runs}")
+
+        print("\n[build_heatmap_grid]")
+        hot_cold = pd.DataFrame({
+            "layer_idx":   [0, 0, 1, 1],
+            "expert_id":   [0, 1, 0, 1],
+            "layer_share": [0.7, 0.3, 0.4, 0.6],
+        })
+        hot_cold_path = root / "hot_cold_grid.csv"
+        hot_cold.to_csv(hot_cold_path, index=False)
+        grid = build_heatmap_grid(hot_cold_path)
+        check("heatmap grid is indexed by layer_idx, columned by expert_id",
+              list(grid.index) == [0, 1] and list(grid.columns) == [0, 1])
+        check("heatmap grid values match the source layer_share exactly",
+              grid.loc[0, 0] == 0.7 and grid.loc[1, 1] == 0.6,
+              f"got\n{grid}")
+
+        missing_csv = root / "no_such_hot_cold.csv"
+        raised_missing = False
+        try:
+            build_heatmap_grid(missing_csv)
+        except FileNotFoundError:
+            raised_missing = True
+        check("a missing hot_cold.csv raises FileNotFoundError, not a confusing pandas error",
+              raised_missing)
+
+        print("\n[build_expert_skew_summary]")
+        skew_hot_cold = pd.DataFrame({
+            "layer_idx":       [0, 0, 0, 0, 1, 1, 1, 1],
+            "expert_id":       [0, 1, 2, 3, 0, 1, 2, 3],
+            "dispatch_count":  [50, 2, 2, 1, 1, 2, 50, 2],
+        })
+        skew_path = root / "hot_cold_skew.csv"
+        skew_hot_cold.to_csv(skew_path, index=False)
+        skew = build_expert_skew_summary(skew_path)
+        total = 50 + 2 + 2 + 1 + 1 + 2 + 50 + 2
+        check("skew summary's top bin is the single highest (layer, expert) row, not a cross-layer sum",
+              skew["top"][0]["dispatch_count"] == 50 and skew["top"][0]["layer_idx"] in (0, 1),
+              f"got {skew['top'][0]}")
+        check("skew summary's top-share is an independent recompute (50 / grand total)",
+              abs(skew["top"][0]["share"] - 50 / total) < 1e-9, f"got {skew['top'][0]['share']}")
+        check("gini reflects genuine per-layer skew (computed per (layer,expert) bin, like "
+              "profiler.classify.gini_overall -- NOT summed across layers first)",
+              skew["gini"] > 0.3, f"got {skew['gini']}")
+        check("max_mean_ratio is an independent recompute over the (layer,expert) bins "
+              "(max count / mean count, 8 bins total)",
+              abs(skew["max_mean_ratio"] - 50 / (total / 8)) < 1e-9,
+              f"got {skew['max_mean_ratio']}")
+        check("top and bottom both come back non-empty",
+              len(skew["top"]) > 0 and len(skew["bottom"]) > 0)
+
+        print("\n[build_expert_skew_summary: cross-layer washout regression]")
+        washout_hot_cold = pd.DataFrame({
+            "layer_idx":      [0, 0, 1, 1],
+            "expert_id":      [0, 1, 0, 1],
+            "dispatch_count": [50, 0, 0, 50],
+        })
+        washout_path = root / "hot_cold_washout.csv"
+        washout_hot_cold.to_csv(washout_path, index=False)
+        washout_skew = build_expert_skew_summary(washout_path)
+        check("a per-layer-maximally-skewed run is NOT reported as uniform, even when each "
+              "expert's cross-layer total is identical (the exact washout this test catches)",
+              washout_skew["gini"] >= 0.5, f"got {washout_skew['gini']}")
+
+        print("\n[build_expert_skew_summary: uniform distribution]")
+        uniform_hot_cold = pd.DataFrame({
+            "layer_idx": [0, 0], "expert_id": [0, 1], "dispatch_count": [10, 10],
+        })
+        uniform_path = root / "hot_cold_uniform.csv"
+        uniform_hot_cold.to_csv(uniform_path, index=False)
+        uniform_skew = build_expert_skew_summary(uniform_path)
+        check("a perfectly uniform distribution has Gini == 0",
+              uniform_skew["gini"] == 0.0, f"got {uniform_skew['gini']}")
+        check("a perfectly uniform distribution has max/mean ratio == 1.0",
+              uniform_skew["max_mean_ratio"] == 1.0, f"got {uniform_skew['max_mean_ratio']}")
+
+        missing_skew_csv = root / "no_such_hot_cold_skew.csv"
+        raised_skew_missing = False
+        try:
+            build_expert_skew_summary(missing_skew_csv)
+        except FileNotFoundError:
+            raised_skew_missing = True
+        check("build_expert_skew_summary raises FileNotFoundError on a missing file",
+              raised_skew_missing)
+
+        print("\n[load_run_metadata / build_model_comparison]")
+        moe_run = root / "moe_run"
+        moe_run.mkdir()
+        moe_meta = {
+            "run_name": "moe_run",
+            "config": {"model": {"name_or_path": "models/mixtral", "architecture": "moe"}},
+            "model_topology": {
+                "n_moe_layers": 32, "top_k": 2, "experts_per_layer": [8] * 32,
+                "total_expert_weight_bytes": 90_000_000_000,
+            },
+            "classification": {
+                "total_dispatches": 500_000, "gini_overall": 0.115,
+                "normalized_entropy_overall": 0.996, "hot_dispatch_share": 0.72,
+            },
+        }
+        (moe_run / "run_metadata.json").write_text(json.dumps(moe_meta), encoding="utf-8")
+
+        dense_run = root / "dense_run"
+        dense_run.mkdir()
+        dense_meta = {
+            "run_name": "dense_run",
+            "config": {"model": {"name_or_path": "gpt2", "architecture": "dense"}},
+            "model_topology": {
+                "n_moe_layers": 12, "top_k": 1, "experts_per_layer": [1] * 12,
+                "total_expert_weight_bytes": 230_000_000,
+            },
+            "classification": {
+                "total_dispatches": 864, "gini_overall": 0.0,
+                "normalized_entropy_overall": 1.0, "hot_dispatch_share": 1.0,
+            },
+        }
+        (dense_run / "run_metadata.json").write_text(json.dumps(dense_meta), encoding="utf-8")
+
+        loaded_meta = load_run_metadata(moe_run)
+        check("load_run_metadata returns the raw dict, run_name intact",
+              loaded_meta["run_name"] == "moe_run")
+
+        missing_meta = root / "does_not_exist_run"
+        raised_meta_missing = False
+        try:
+            load_run_metadata(missing_meta)
+        except FileNotFoundError as exc:
+            raised_meta_missing = "profiler.cli run" in str(exc)
+        check("load_run_metadata raises on a missing file, naming the producing command",
+              raised_meta_missing)
+
+        comparison_df = build_model_comparison([moe_run, dense_run])
+        check("build_model_comparison returns one row per run, in the order given",
+              list(comparison_df["run_name"]) == ["moe_run", "dense_run"],
+              f"got {list(comparison_df['run_name'])}")
+        check("build_model_comparison surfaces architecture, experts/layer, and gini per run",
+              comparison_df.loc[0, "architecture"] == "moe"
+              and comparison_df.loc[0, "experts_per_layer"] == 8
+              and comparison_df.loc[0, "gini_overall"] == 0.115
+              and comparison_df.loc[1, "architecture"] == "dense"
+              and comparison_df.loc[1, "experts_per_layer"] == 1
+              and comparison_df.loc[1, "gini_overall"] == 0.0,
+              f"got\n{comparison_df}")
+        check("build_model_comparison converts total weight bytes to GB",
+              abs(comparison_df.loc[0, "total_expert_weight_gb"] - 90.0) < 1e-6,
+              f"got {comparison_df.loc[0, 'total_expert_weight_gb']}")
+
+        print("\n[list_pooling_results / load_pooling_result]")
+        pooling_payload = {
+            "gpu_names": ["gpu0", "gpu1"],
+            "per_gpu_cold_bytes": {"gpu0": 2000, "gpu1": 2000},
+            "dedicated_total_cold_bytes": 4000,
+            "pooled_total_cold_bytes": 3000,
+            "savings_bytes": 1000,
+            "savings_pct": 25.0,
+            "shared_cold_pairs": 1,
+            "total_unique_cold_pairs": 3,
+        }
+        pooling_path = results_dir / "mixtral_pooling.json"
+        pooling_path.write_text(json.dumps(pooling_payload), encoding="utf-8")
+
+        found_pooling = list_pooling_results(results_dir)
+        check("list_pooling_results finds the pooling file and excludes the comparison file",
+              found_pooling == [pooling_path], f"got {found_pooling}")
+
+        check("list_comparison_results excludes the pooling file sharing the same directory "
+              "(the real bug this pairing exists to catch: both write into experiments/results/)",
+              pooling_path not in list_comparison_results(results_dir),
+              f"got {list_comparison_results(results_dir)}")
+
+        loaded_pooling = load_pooling_result(pooling_path)
+        check("load_pooling_result returns the raw dict, savings_pct intact",
+              loaded_pooling["savings_pct"] == 25.0)
+
+        missing_pooling = results_dir / "does_not_exist_pooling.json"
+        raised_pooling_missing = False
+        try:
+            load_pooling_result(missing_pooling)
+        except FileNotFoundError as exc:
+            raised_pooling_missing = "scheduler.cli pool" in str(exc)
+        check("load_pooling_result raises on a missing file, naming the producing command",
+              raised_pooling_missing)
+
+    print("\n" + "=" * 62)
+    if failures:
+        print(f"{len(failures)} FAILED: {failures}")
+        print("=" * 62)
+        return 1
+    print("dashboard selftest passed")
+    print("=" * 62)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
